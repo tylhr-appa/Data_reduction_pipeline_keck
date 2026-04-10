@@ -1,0 +1,218 @@
+[
+  {
+    "file": "Ls0_T210_tau0.1.dat",
+    "Ls": 0,
+    "T": 210,
+    "dust_tau": 0.1
+  },
+  {
+    "file": "Ls90_T210_tau0.1.dat",
+    "Ls": 90,
+    "T": 210,
+    "dust_tau": 0.1
+  },
+  {
+    "file": "Ls180_T210_tau0.1.dat",
+    "Ls": 180,
+    "T": 210,
+    "dust_tau": 0.1
+  },
+  {
+    "file": "Ls270_T210_tau0.1.dat",
+    "Ls": 270,
+    "T": 210,
+    "dust_tau": 0.1
+  },
+  {
+    "file": "Ls0_T240_tau0.1.dat",
+    "Ls": 0,
+    "T": 240,
+    "dust_tau": 0.1
+  },
+  {
+    "file": "Ls90_T240_tau0.1.dat",
+    "Ls": 90,
+    "T": 240,
+    "dust_tau": 0.1
+  },
+  {
+    "file": "Ls180_T240_tau0.1.dat",
+    "Ls": 180,
+    "T": 240,
+    "dust_tau": 0.1
+  },
+  {
+    "file": "Ls270_T240_tau0.1.dat",
+    "Ls": 270,
+    "T": 240,
+    "dust_tau": 0.1
+  },
+  {
+    "file": "Ls0_T270_tau0.1.dat",
+    "Ls": 0,
+    "T": 270,
+    "dust_tau": 0.1
+  },
+  {
+    "file": "Ls90_T270_tau0.1.dat",
+    "Ls": 90,
+    "T": 270,
+    "dust_tau": 0.1
+  },
+  {
+    "file": "Ls180_T270_tau0.1.dat",
+    "Ls": 180,
+    "T": 270,
+    "dust_tau": 0.1
+  },
+  {
+    "file": "Ls270_T270_tau0.1.dat",
+    "Ls": 270,
+    "T": 270,
+    "dust_tau": 0.1
+  },
+  {
+    "file": "Ls0_T210_tau0.5.dat",
+    "Ls": 0,
+    "T": 210,
+    "dust_tau": 0.5
+  },
+  {
+    "file": "Ls90_T210_tau0.5.dat",
+    "Ls": 90,
+    "T": 210,
+    "dust_tau": 0.5
+  },
+  {
+    "file": "Ls180_T210_tau0.5.dat",
+    "Ls": 180,
+    "T": 210,
+    "dust_tau": 0.5
+  },
+  {
+    "file": "Ls270_T210_tau0.5.dat",
+    "Ls": 270,
+    "T": 210,
+    "dust_tau": 0.5
+  },
+  {
+    "file": "Ls0_T240_tau0.5.dat",
+    "Ls": 0,
+    "T": 240,
+    "dust_tau": 0.5
+  },
+  {
+    "file": "Ls90_T240_tau0.5.dat",
+    "Ls": 90,
+    "T": 240,
+    "dust_tau": 0.5
+  },
+  {
+    "file": "Ls180_T240_tau0.5.dat",
+    "Ls": 180,
+    "T": 240,
+    "dust_tau": 0.5
+  },
+  {
+    "file": "Ls270_T240_tau0.5.dat",
+    "Ls": 270,
+    "T": 240,
+    "dust_tau": 0.5
+  },
+  {
+    "file": "Ls0_T270_tau0.5.dat",
+    "Ls": 0,
+    "T": 270,
+    "dust_tau": 0.5
+  },
+  {
+    "file": "Ls90_T270_tau0.5.dat",
+    "Ls": 90,
+    "T": 270,
+    "dust_tau": 0.5
+  },
+  {
+    "file": "Ls180_T270_tau0.5.dat",
+    "Ls": 180,
+    "T": 270,
+    "dust_tau": 0.5
+  },
+  {
+    "file": "Ls270_T270_tau0.5.dat",
+    "Ls": 270,
+    "T": 270,
+    "dust_tau": 0.5
+  },
+  {
+    "file": "Ls0_T210_tau2.0.dat",
+    "Ls": 0,
+    "T": 210,
+    "dust_tau": 2.0
+  },
+  {
+    "file": "Ls90_T210_tau2.0.dat",
+    "Ls": 90,
+    "T": 210,
+    "dust_tau": 2.0
+  },
+  {
+    "file": "Ls180_T210_tau2.0.dat",
+    "Ls": 180,
+    "T": 210,
+    "dust_tau": 2.0
+  },
+  {
+    "file": "Ls270_T210_tau2.0.dat",
+    "Ls": 270,
+    "T": 210,
+    "dust_tau": 2.0
+  },
+  {
+    "file": "Ls0_T240_tau2.0.dat",
+    "Ls": 0,
+    "T": 240,
+    "dust_tau": 2.0
+  },
+  {
+    "file": "Ls90_T240_tau2.0.dat",
+    "Ls": 90,
+    "T": 240,
+    "dust_tau": 2.0
+  },
+  {
+    "file": "Ls180_T240_tau2.0.dat",
+    "Ls": 180,
+    "T": 240,
+    "dust_tau": 2.0
+  },
+  {
+    "file": "Ls270_T240_tau2.0.dat",
+    "Ls": 270,
+    "T": 240,
+    "dust_tau": 2.0
+  },
+  {
+    "file": "Ls0_T270_tau2.0.dat",
+    "Ls": 0,
+    "T": 270,
+    "dust_tau": 2.0
+  },
+  {
+    "file": "Ls90_T270_tau2.0.dat",
+    "Ls": 90,
+    "T": 270,
+    "dust_tau": 2.0
+  },
+  {
+    "file": "Ls180_T270_tau2.0.dat",
+    "Ls": 180,
+    "T": 270,
+    "dust_tau": 2.0
+  },
+  {
+    "file": "Ls270_T270_tau2.0.dat",
+    "Ls": 270,
+    "T": 270,
+    "dust_tau": 2.0
+  }
+]
