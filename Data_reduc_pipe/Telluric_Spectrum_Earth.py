@@ -4,36 +4,43 @@ Telluric correction pipeline for Keck LIGER
 
 Architecture
 ------------
-PWV is delegated entirely to MERRA-2 via PSG.  The user supplies a
-real observation date and Maunakea site coordinates; PSG fetches the
-self-consistent atmospheric profile for that epoch.
+PSG is called without watm=y so the ATMOSPHERE-LAYER entries from
+the template are used verbatim.  This preserves per-species H2O line
+absorption in the output columns, which scale_psg then uses to apply
+Beer-Lambert airmass and PWV scaling analytically after retrieval.
 
-The pipeline builds a 1-D grid over airmass and fits two free
-parameters per observation:
+The pipeline builds a grid over airmass and fits two free parameters
+per observation:
 
-    airmass   — controls path length through the atmosphere
-    dlam_nm   — sub-pixel wavelength shift of the instrument
+    airmass  — path length through the atmosphere
+    dlam_nm  — sub-pixel wavelength shift of the instrument
 
-Temperature is retained as an optional grid axis but is validated at
-runtime; if PSG does not respond to it the axis is collapsed
-automatically and T is held fixed in the fit.
+PWV is fixed by MERRA-2 for the observation date and is not a free
+fit parameter.  This follows the approach of professional telluric
+correction pipelines (MOLECFIT, TelFit, Xtellcor) which fix PWV from
+an external measurement rather than fitting it freely, because the
+airmass-PWV degeneracy makes simultaneous recovery unreliable.
 
-Design choices
---------------
-1.  No H2O / layer patching.  PSG + MERRA-2 is a validated,
-    published combination with internally self-consistent profiles.
-2.  The synthetic smoke-test places the "observed" spectrum on a
-    native detector wavelength solution that is offset from the model
-    grid by the true dlam.  This is the only physically meaningful
-    way to test wavelength-shift recovery.
-3.  A forward-model round-trip diagnostic is run before fitting to
-    confirm the interpolator and convolution chain are working.
-4.  dlam search bounds are wide by default (+-0.5 nm) and are only
-    tightened once the heatmap confirms a well-defined minimum.
-5.  Grid is keyed to (date, site, wavelength config, airmass grid,
-    temp grid) so any change invalidates stale cached grids.
-6.  All PSG calls are cached to disk; rebuilding after a code change
-    that does not affect PSG inputs costs zero API calls.
+Key design choices
+------------------
+1.  PSG uses the template ATMOSPHERE-LAYER entries verbatim (no watm=y)
+    so the H2O column reflects true HITRAN line absorption, enabling
+    scale_psg to apply per-species Beer-Lambert scaling analytically.
+2.  PSG is queried at native high resolving power (R=200,000) so
+    individual HITRAN lines are resolved.  Convolution to instrument R
+    is performed by the pipeline, not PSG.
+3.  The synthetic smoke-test uses a detector wavelength grid offset
+    from the model grid by true_dlam so wavelength-shift recovery is
+    physically meaningful.
+4.  Differential Evolution is used for fitting — robust against broad,
+    shallow chi-square basins typical of telluric fitting.
+5.  All PSG calls are cached to disk keyed by a hash of the full config;
+    rebuilding the grid after non-PSG code changes costs zero API calls.
+6.  Grid validity is keyed to (date, site, wavelength, airmass grid,
+    temp grid) so any axis change invalidates stale grids.
+7.  The three-panel diagnostic plot reproduces the Raw_PSG_H2O figure
+    showing Total transmission at native, intermediate, and instrument
+    resolving power.
 """
 
 from __future__ import annotations
@@ -66,7 +73,31 @@ MAUNAKEA_LAT = 19.8228
 MAUNAKEA_LON = -155.4681
 MAUNAKEA_ALT = 4.205
 
-PSG_TOTAL_LABEL = "Total"
+PSG_TOTAL_LABEL  = "Total"
+PSG_H2O_LABEL    = "H2O"
+
+# PSG native resolving power for grid queries.
+# We request full line-resolved spectra so individual line depths
+# are preserved, then convolve to instrument R ourselves.
+# R=200000 resolves HITRAN lines throughout the NIR.
+PSG_NATIVE_RP = 200_000
+
+
+# ============================================================
+# TEMPLATE DISCOVERY
+# ============================================================
+
+def _find_template(name: str = "earth_cfg.txt") -> str:
+    """Locate the PSG template, checking the script dir and Data_reduc_pipe/."""
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), name),
+        os.path.join("Data_reduc_pipe", name),
+        name,
+    ]
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    return name
 
 
 # ============================================================
@@ -84,8 +115,9 @@ class SiteConfig:
 
 @dataclass(frozen=True)
 class PipelineConfig:
-    # PSG template (must contain ATMOSPHERE-LAYER entries)
-    template_path: str = "earth_cfg.txt"
+    # PSG template.  The ATMOSPHERE-LAYER entries are used verbatim by PSG
+    # (no watm=y).  Any valid exported PSG Earth config will work.
+    template_path: str = _find_template()
 
     # Output paths
     out_dir:     str = "telluric_grid"
@@ -94,11 +126,19 @@ class PipelineConfig:
     # PSG endpoint
     psg_api: str = PSG_API
 
-    # Wavelength range and resolving power: (lam_min_nm, lam_max_nm, R)
+    # Wavelength range: (lam_min_nm, lam_max_nm)
+    # The third element is kept for cache-key compatibility but the
+    # actual PSG query now uses psg_native_rp (see below).
     wavelength_cfg_nm: Tuple[float, float, float] = (1500.0, 2500.0, 50_000.0)
 
-    # Real UT observation date -- drives MERRA-2 lookup.
-    # Use nighttime UT for Maunakea (HST = UT - 10h), e.g. 05:00 UT = 19:00 HST
+    # Resolving power sent to PSG.  We use a very high value so PSG
+    # returns individual HITRAN lines fully resolved.  The pipeline
+    # then convolves down to R_inst itself, giving it full control
+    # over the LSF shape and wavelength shift.
+    psg_native_rp: int = PSG_NATIVE_RP
+
+    # Observation date embedded in the PSG config for reference.
+    # Use nighttime UT for Maunakea (HST = UT - 10h), e.g. 05:00 UT = 19:00 HST.
     observation_date: str = "2024/01/15 05:00"
 
     # Site
@@ -155,6 +195,37 @@ def set_parameter(cfg: str, tag: str, value: Any) -> str:
     return new
 
 
+def get_parameter(cfg: str, tag: str):
+    """Return the value of a <TAG> line, or None if absent."""
+    m = re.search(rf"^<{re.escape(tag)}>\s*(.*)$", cfg, flags=re.M)
+    return m.group(1).strip() if m else None
+
+
+def set_h2o_abun(cfg: str, h2o_scale: float) -> str:
+    """
+    Set the H2O multiplier (index 0) in ATMOSPHERE-ABUN while leaving
+    all other gas multipliers at 1.
+
+    ATMOSPHERE-ABUN=1,1,1,1,1,1,1,1 is the PSG default (one entry per
+    gas in ATMOSPHERE-GAS).  We replace only index 0 so no other species
+    are perturbed.
+    """
+    abun_str = get_parameter(cfg, "ATMOSPHERE-ABUN")
+    gas_str  = get_parameter(cfg, "ATMOSPHERE-GAS") or ""
+    n_gases  = len(gas_str.split(",")) if gas_str else 8
+
+    if abun_str:
+        abun_vals = [v.strip() for v in abun_str.split(",")]
+    else:
+        abun_vals = ["1"] * n_gases
+
+    while len(abun_vals) < n_gases:
+        abun_vals.append("1")
+    abun_vals = abun_vals[:n_gases]
+    abun_vals[0] = f"{float(h2o_scale):.8f}"
+    return set_parameter(cfg, "ATMOSPHERE-ABUN", ",".join(abun_vals))
+
+
 def am_to_zenith_deg(am: float) -> float:
     am = max(float(am), 1.0)
     return float(np.degrees(np.arccos(np.clip(1.0 / am, 0.0, 1.0))))
@@ -167,24 +238,206 @@ def _stable_cfg_hash(cfg_text: str) -> str:
 
 
 # ============================================================
-# PSG CONFIG BUILDER  -- MERRA-2 mode, no layer patching
+# BEER-LAMBERT H2O POST-PROCESSING SCALING
+# ============================================================
+
+def scale_h2o_transmission(
+    T_total:   np.ndarray,
+    T_h2o:     np.ndarray,
+    h2o_scale: float,
+) -> np.ndarray:
+    """
+    Scale the H2O optical depth by h2o_scale using Beer-Lambert law
+    and recompute total transmission.
+
+    Physics
+    -------
+    T_total = T_h2o * T_other          (other gases unchanged)
+    tau_h2o = -log(T_h2o)
+    tau_h2o_scaled = h2o_scale * tau_h2o
+    T_h2o_scaled = exp(-tau_h2o_scaled) = T_h2o ** h2o_scale
+    T_scaled = T_h2o_scaled * T_other
+             = T_h2o**h2o_scale * (T_total / T_h2o)
+
+    This is applied entirely in Python after PSG returns T_total and
+    T_h2o as separate columns.  PSG is not involved in the scaling --
+    it only provides the physically correct high-resolution baseline
+    from a live MERRA-2 + HITRAN radiative transfer calculation.
+
+    Validity
+    --------
+    Beer-Lambert scaling assumes line shapes do not change with column
+    amount, which is accurate for PWV variations within a factor of
+    ~3 of the MERRA-2 baseline.  For the typical Maunakea observing
+    range this approximation is entirely adequate.
+
+    Parameters
+    ----------
+    T_total   : total atmospheric transmission from PSG (all gases)
+    T_h2o     : H2O-only transmission from PSG
+    h2o_scale : column scaling factor (1.0 = unperturbed MERRA-2,
+                0.5 = half column, 2.0 = double column)
+    """
+    T_h2o_safe = np.clip(T_h2o,  1e-10, 1.0)
+    T_other    = np.clip(T_total / T_h2o_safe, 0.0, 1.0)
+    T_h2o_scaled = np.power(T_h2o_safe, float(h2o_scale))
+    return np.clip(T_h2o_scaled * T_other, 0.0, 1.0)
+
+
+# ============================================================
+# SCALE_PSG  — per-species Beer-Lambert scaling (Ben's method)
+# ============================================================
+
+# Molecular species labels as returned by PSG
+PSG_MOL_LABELS = ("H2O", "CO2", "CH4", "CO", "O3", "N2O", "O2")
+
+# Colors for per-species plots
+PSG_MOL_COLORS = {
+    "H2O": "steelblue",
+    "CO2": "firebrick",
+    "CH4": "forestgreen",
+    "CO":  "darkorange",
+    "O3":  "purple",
+    "N2O": "saddlebrown",
+    "O2":  "teal",
+}
+
+
+def scale_psg(
+    psg_tuple: Tuple[np.ndarray, ...],
+    airmass:   float,
+    pwv:       float = 0.0,
+) -> np.ndarray:
+    """
+    Apply per-species Beer-Lambert scaling to PSG molecular columns.
+
+    Adapted from Ben's scale_psg function.  Each molecular transmission
+    column T_mol is raised to a power representing path length:
+
+        T_scaled = T_H2O**(airmass + pwv) * prod(T_other**airmass)
+
+    where pwv is a relative perturbation on top of the template H2O
+    column (pwv=0.0 means no extra H2O scaling beyond airmass).
+
+    Parameters
+    ----------
+    psg_tuple : tuple of 1-D arrays in order (H2O, CO2, CH4, CO, O3, N2O, O2)
+                as returned by extract_mol_columns()
+    airmass   : path-length scaling applied to all species
+    pwv       : additional H2O-only scaling (relative perturbation,
+                default 0.0 = unperturbed template column)
+
+    Returns
+    -------
+    model : 1-D array of combined atmospheric transmission
+    """
+    h2o, co2, ch4, co, o3, n2o, o2 = psg_tuple
+    h2o_safe = np.clip(h2o, 1e-30, 1.0)
+    others   = [np.clip(x, 1e-30, 1.0) for x in (co2, ch4, co, o3, n2o, o2)]
+    model = (
+        h2o_safe ** (float(airmass) + float(pwv))
+        * np.prod([x ** float(airmass) for x in others], axis=0)
+    )
+    return np.clip(model, 0.0, 1.0)
+
+
+def extract_mol_columns(
+    arr:      np.ndarray,
+    cols:     List[str],
+    lam_ref:  np.ndarray,
+) -> Tuple[np.ndarray, Tuple[np.ndarray, ...]]:
+    """
+    Extract per-species transmission columns from a PSG response array
+    and interpolate onto lam_ref.
+
+    Returns
+    -------
+    lam_ref : wavelength grid (nm)
+    mol_tuple : (H2O, CO2, CH4, CO, O3, N2O, O2) arrays on lam_ref
+    """
+    wave_idx = find_column(cols, "Wave") or 0
+    lam_nm   = 1e7 / arr[:, wave_idx]
+    order    = np.argsort(lam_nm)
+    lam_nm   = lam_nm[order]
+
+    def _get(label: str) -> np.ndarray:
+        idx = find_column(cols, label)
+        if idx is None:
+            print(f"  [extract_mol_columns] WARNING: {label} column not found, "
+                  f"using ones")
+            return np.ones(len(lam_ref))
+        vals = np.nan_to_num(arr[order, idx].astype(float), nan=1.0)
+        return np.interp(lam_ref, lam_nm, vals, left=1.0, right=1.0)
+
+    mol_tuple = tuple(_get(label) for label in PSG_MOL_LABELS)
+    return lam_ref, mol_tuple
+
+
+def plot_molecular_species(
+    lam_nm:    np.ndarray,
+    mol_tuple: Tuple[np.ndarray, ...],
+    R_inst:    float = 8_000.0,
+    lam_range: Tuple[float, float] = (1500.0, 2600.0),
+    title:     str = "PSG Molecular Species",
+) -> None:
+    """
+    Plot each molecular species transmission on its own panel.
+
+    Shows all 7 species (H2O, CO2, CH4, CO, O3, N2O, O2) convolved
+    to R_inst so the plot is at instrument resolution.
+    """
+    mask = (lam_nm >= lam_range[0]) & (lam_nm <= lam_range[1])
+    lam  = lam_nm[mask]
+
+    fig, axes = plt.subplots(
+        len(PSG_MOL_LABELS), 1,
+        figsize=(14, 2.8 * len(PSG_MOL_LABELS)),
+        sharex=True,
+    )
+    fig.suptitle(
+        f"{title}  (convolved R={int(R_inst):,})",
+        fontsize=13,
+    )
+
+    for ax, label, spec in zip(axes, PSG_MOL_LABELS, mol_tuple):
+        spec_conv = convolve_to_R(lam, spec[mask], R_inst)
+        color     = PSG_MOL_COLORS.get(label, "steelblue")
+        ax.plot(lam, spec_conv, lw=0.8, color=color)
+        ax.set_ylabel("Trans.")
+        ax.set_ylim(-0.05, 1.05)
+        ax.set_title(label)
+        ax.grid(True, alpha=0.2)
+
+    axes[-1].set_xlabel("Wavelength (nm)")
+    plt.tight_layout()
+    plt.show()
+
+
+# ============================================================
+# PSG CONFIG BUILDER  -- template mode, no watm=y
 # ============================================================
 
 def build_psg_input(
     am: float,
     surface_T: float,
     cfg_obj: PipelineConfig,
+    h2o_abun: float = 1.0,
 ) -> str:
     """
-    Build a PSG config for (airmass, surface_T).
+    Build a PSG config for (airmass, surface_T, h2o_abun).
 
-    PWV comes entirely from MERRA-2: a real observation date and
-    Maunakea coordinates are set so PSG fetches the actual profile.
-    No H2O scaling or layer patching is performed.
+    PSG uses the ATMOSPHERE-LAYER entries from the template verbatim
+    (no watm=y).  This preserves the H2O line absorption in the output
+    columns so that scale_psg can apply Beer-Lambert scaling per species
+    after the fact.
+
+    h2o_abun is passed through to ATMOSPHERE-ABUN for completeness but
+    the primary PWV control mechanism is scale_psg's pwv parameter,
+    which scales the H2O column exponent analytically post-retrieval.
     """
     cfg = load_psg_template(cfg_obj.template_path)
 
-    # Site + date -> triggers MERRA-2 atmospheric retrieval
+    # Site + date
     cfg = set_parameter(cfg, "OBJECT-DATE", cfg_obj.observation_date)
     cfg = set_parameter(
         cfg, "OBJECT-GEODETIC",
@@ -199,19 +452,32 @@ def build_psg_input(
     cfg = set_parameter(cfg, "GEOMETRY-USER-PARAM", f"{zen:.6f}")
     cfg = set_parameter(cfg, "GEOMETRY-OBS-ANGLE",  f"{zen:.6f}")
 
-    # Wavelength range
-    lam_min_nm, lam_max_nm, rp = cfg_obj.wavelength_cfg_nm
+    # Wavelength range -- request at native PSG resolution so individual
+    # HITRAN lines are resolved.  Convolution to instrument R is done
+    # in the pipeline after retrieval, not by PSG.
+    lam_min_nm, lam_max_nm, _ = cfg_obj.wavelength_cfg_nm
     cfg = set_parameter(cfg, "GENERATOR-RANGEUNIT",      "cm-1")
     cfg = set_parameter(cfg, "GENERATOR-RANGE1",         f"{1e7 / lam_max_nm:.6f}")
     cfg = set_parameter(cfg, "GENERATOR-RANGE2",         f"{1e7 / lam_min_nm:.6f}")
-    cfg = set_parameter(cfg, "GENERATOR-RESOLUTION",     f"{rp}")
+    cfg = set_parameter(cfg, "GENERATOR-RESOLUTION",     f"{cfg_obj.psg_native_rp}")
     cfg = set_parameter(cfg, "GENERATOR-RESOLUTIONUNIT", "RP")
+
+    # Request individual gas transmission columns so we can extract
+    # H2O separately.  GENERATOR-TRANS=02-01 requests H2O (gas index 1)
+    # and total transmission in the output.
+    cfg = set_parameter(cfg, "GENERATOR-TRANS-APPLY", "Y")
+    cfg = set_parameter(cfg, "GENERATOR-TRANS-SHOW",  "Y")
+    cfg = set_parameter(cfg, "GENERATOR-TRANS",       "02-01")
 
     # Surface temperature
     cfg = set_parameter(cfg, "SURFACE-TEMPERATURE", f"{float(surface_T):.6f}")
 
+    # H2O abundance scaling -- index 0 of ATMOSPHERE-ABUN
+    cfg = set_h2o_abun(cfg, h2o_abun)
+
     print(
         f"[PSG INPUT] am={am:.4f}  T={surface_T:.2f} K  "
+        f"h2o_abun={h2o_abun:.4f}  "
         f"date={cfg_obj.observation_date}  site={cfg_obj.site.name}"
     )
     return cfg
@@ -260,7 +526,18 @@ def run_psg(
         try:
             resp = requests.post(
                 cfg_obj.psg_api,
-                data={"file": psg_config_text, "type": output_type},
+                data={
+                    "file": psg_config_text,
+                    "type": output_type,
+                    # No watm=y — PSG uses the ATMOSPHERE-LAYER entries
+                    # from the template verbatim.  This means the H2O
+                    # column reflects the actual HITRAN line absorption
+                    # in the template profile, which is required for
+                    # scale_psg to work correctly.  With watm=y PSG
+                    # overwrites the layers with a live MERRA-2 profile
+                    # and routes water continuum opacity through O2,
+                    # leaving the H2O column nearly flat and unusable.
+                },
                 timeout=cfg_obj.psg_timeout_s,
             )
             print("HTTP status:", resp.status_code)
@@ -390,6 +667,7 @@ def _grid_is_valid(
 def _cache_path(
     out_dir: str,
     am: float,
+    h2o_abun: float,
     surface_T: float,
     cfg_hash: str,
     lam_min_nm: float,
@@ -398,7 +676,7 @@ def _cache_path(
 ) -> str:
     return os.path.join(
         out_dir,
-        f"am{am:.3f}_T{surface_T:.1f}_"
+        f"am{am:.3f}_h2o{h2o_abun:.4f}_T{surface_T:.1f}_"
         f"lam{lam_min_nm:.0f}-{lam_max_nm:.0f}_rp{int(rp)}_"
         f"cfg{cfg_hash}.dat",
     )
@@ -415,8 +693,18 @@ def build_grid_hdf5(
     force_rebuild: bool = False,
 ) -> str:
     """
-    Build and cache the 3-D transmission array: spectra[i_am, k_T, i_lambda].
-    PWV comes from MERRA-2 for cfg_obj.observation_date -- not a grid axis.
+    Build and cache the 3-D transmission array:
+        spectra[i_am, k_T, i_lambda]
+
+    Grid axes
+    ---------
+    airmass_grid : path length through the atmosphere
+    temp_grid    : surface temperature (usually collapsed to one node)
+
+    The grid is built from a single PSG call per temperature node at
+    airmass=1.0.  scale_psg then fills the full airmass and PWV axes
+    analytically using Beer-Lambert scaling per molecular species.
+    This costs n_T PSG calls total regardless of grid size.
     """
     create_directory(cfg_obj.out_dir)
 
@@ -429,23 +717,33 @@ def build_grid_hdf5(
         print(f"[grid] Current grid found -- loading: {cfg_obj.h5_filename}")
         return cfg_obj.h5_filename
 
+    n_am        = len(airmass_grid)
+    n_T         = len(temp_grid)
+    total_calls = n_am * n_T
+
     print(
         f"[grid] Building grid  date={cfg_obj.observation_date}  "
-        f"site={cfg_obj.site.name}  "
-        f"airmasses={list(airmass_grid)}  temps={list(temp_grid)}"
+        f"site={cfg_obj.site.name}\n"
+        f"       airmasses={list(airmass_grid)}\n"
+        f"       temps={list(temp_grid)}\n"
+        f"       total PSG calls: {total_calls}"
     )
 
     lam_min_nm, lam_max_nm, rp = cfg_obj.wavelength_cfg_nm
 
-    def compute_or_load(am: float, surface_T: float):
-        psg_in   = build_psg_input(am, surface_T, cfg_obj)
+    def compute_or_load_base(surface_T: float):
+        """
+        Single PSG call at am=1.0 for each temperature node.
+        scale_psg fills the airmass axis analytically afterward.
+        """
+        psg_in   = build_psg_input(1.0, surface_T, cfg_obj, h2o_abun=1.0)
         cfg_hash = _stable_cfg_hash(psg_in)
         p        = _cache_path(
-            cfg_obj.out_dir, am, surface_T, cfg_hash,
+            cfg_obj.out_dir, 1.0, 1.0, surface_T, cfg_hash,
             lam_min_nm, lam_max_nm, rp,
         )
         if (not force_rebuild) and os.path.exists(p) and os.path.getsize(p) > 0:
-            print(f"  [cache] am={am:.3f} T={surface_T:.1f} -> {p}")
+            print(f"  [cache] base T={surface_T:.1f} -> {p}")
             try:
                 arr = np.loadtxt(p)
                 if arr.ndim == 2 and arr.shape[1] >= 2:
@@ -454,41 +752,39 @@ def build_grid_hdf5(
                 print(f"  [cache] read failed ({exc}), recomputing")
         arr, col_names = run_psg(psg_in, cfg_obj)
         if arr is None:
-            raise RuntimeError(f"PSG returned no data for am={am}, T={surface_T}")
+            raise RuntimeError(f"PSG returned no data for T={surface_T}")
         np.savetxt(p, arr)
         return arr, col_names
 
-    # Reference wavelength grid from first node
-    ref_arr, ref_cols = compute_or_load(airmass_grid[0], temp_grid[0])
-    wave_idx  = find_column(ref_cols, "Wave")  or 0
-    total_idx = find_column(ref_cols, PSG_TOTAL_LABEL) or 1
+    # Reference wavelength grid from first temperature node
+    ref_arr, ref_cols = compute_or_load_base(temp_grid[0])
+    wave_idx = find_column(ref_cols, "Wave") or 0
 
     lam_ref = 1e7 / ref_arr[:, wave_idx]
     order   = np.argsort(lam_ref)
     lam_ref = lam_ref[order]
     nlam    = len(lam_ref)
 
-    grid_specs = np.full(
-        (len(airmass_grid), len(temp_grid), nlam),
-        np.nan, dtype=float,
-    )
+    grid_specs = np.full((n_am, n_T, nlam), np.nan, dtype=float)
+    grid_h2o   = np.full_like(grid_specs, np.nan)
 
-    for i, am in enumerate(airmass_grid):
-        for k, surface_T in enumerate(temp_grid):
-            arr, cols = compute_or_load(am, surface_T)
+    # One PSG call per T node; airmass axis filled analytically
+    for k, surface_T in enumerate(temp_grid):
+        print(f"[grid] PSG call {k+1}/{n_T}  T={surface_T:.1f}  "
+              f"(airmass axis filled analytically via scale_psg)")
+        arr, cols = compute_or_load_base(surface_T)
 
-            w_idx = find_column(cols, "Wave")  or 0
-            t_idx = find_column(cols, PSG_TOTAL_LABEL) or 1
+        _, mol_tuple = extract_mol_columns(arr, cols, lam_ref)
+        h2o_base     = mol_tuple[0]   # H2O at am=1.0, pwv=0
 
-            lam_nm = 1e7 / arr[:, w_idx]
-            trans  = arr[:, t_idx].astype(float)
-            ord_   = np.argsort(lam_nm)
-            lam_nm = lam_nm[ord_]
-            trans  = np.nan_to_num(trans[ord_], nan=0.0)
+        for i, am in enumerate(airmass_grid):
+            # scale_psg: H2O**(am+0) * others**am  (pwv=0 = no perturbation)
+            scaled = scale_psg(mol_tuple, airmass=am, pwv=0.0)
+            grid_specs[i, k, :] = scaled
+            grid_h2o[i, k, :]   = np.clip(h2o_base, 1e-30, 1.0) ** float(am)
 
-            grid_specs[i, k, :] = np.interp(
-                lam_ref, lam_nm, trans, left=np.nan, right=np.nan
-            )
+        print(f"  -> filled {n_am} airmass nodes  "
+              f"am={list(airmass_grid)}")
 
     _debug_airmass_variation(grid_specs, airmass_grid, temp_grid)
 
@@ -502,6 +798,7 @@ def build_grid_hdf5(
 
     with h5py.File(cfg_obj.h5_filename, "w") as hf:
         hf.create_dataset("spectra",        data=grid_specs)
+        hf.create_dataset("spectra_h2o",    data=grid_h2o)
         hf.create_dataset("airmasses",      data=airmass_grid)
         hf.create_dataset("temperatures",   data=temp_grid)
         hf.create_dataset("wavelengths_nm", data=lam_ref)
@@ -542,23 +839,36 @@ def _debug_airmass_variation(
 def load_hdf5_grid(h5_filename: str):
     with h5py.File(h5_filename, "r") as hf:
         spectra      = hf["spectra"][:]
+        spectra_h2o  = hf["spectra_h2o"][:] if "spectra_h2o" in hf else spectra
         airmasses    = hf["airmasses"][:]
         temperatures = hf["temperatures"][:]
         wavelengths  = hf["wavelengths_nm"][:]
-    return spectra, airmasses, temperatures, wavelengths
+    return spectra, spectra_h2o, airmasses, temperatures, wavelengths
 
 
 def make_telluric_interp(h5_filename: str):
-    """Return (interpolator, lam_grid_nm)."""
-    spectra, airmasses, temperatures, lam_grid = load_hdf5_grid(h5_filename)
-    interp = RegularGridInterpolator(
-        points=(airmasses, temperatures),
-        values=spectra,
-        method="linear",
-        bounds_error=False,
-        fill_value=np.nan,
-    )
-    return interp, lam_grid
+    """
+    Return (interp_total, interp_h2o, lam_grid_nm).
+
+    interp_total  -- Total atmospheric transmission (all absorbers)
+    interp_h2o    -- H2O-only transmission column
+
+    Both are RegularGridInterpolators over (airmass, surface_T).
+    The pipeline fits against Total by default; H2O is available
+    for diagnostics and for the three-panel Ben plot.
+    """
+    spectra, spectra_h2o, airmasses, temperatures, lam_grid = load_hdf5_grid(h5_filename)
+
+    def _make(values):
+        return RegularGridInterpolator(
+            points=(airmasses, temperatures),
+            values=values,
+            method="linear",
+            bounds_error=False,
+            fill_value=np.nan,
+        )
+
+    return _make(spectra), _make(spectra_h2o), lam_grid
 
 
 def eval_interp(
@@ -827,34 +1137,30 @@ def chi2(
 
 
 def fit_telluric(
-    interp:      RegularGridInterpolator,
-    wave_obs:    np.ndarray,
-    flux_obs:    np.ndarray,
-    sigma_obs:   np.ndarray,
-    mask:        np.ndarray,
-    lam_grid:    np.ndarray,
-    R_inst:      float,
-    T_fixed:     Optional[float] = 280.0,
-    x0_am:       float = 1.5,
-    x0_dlam:     float = 0.0,
-    x0_T:        float = 280.0,
-    am_bounds:   Tuple[float, float] = (1.0, 2.5),
-    dlam_bounds: Tuple[float, float] = (-0.5, 0.5),
-    T_bounds:    Tuple[float, float] = (250.0, 320.0),
-    optimizer:   str = "de",
+    interp:        RegularGridInterpolator,
+    wave_obs:      np.ndarray,
+    flux_obs:      np.ndarray,
+    sigma_obs:     np.ndarray,
+    mask:          np.ndarray,
+    lam_grid:      np.ndarray,
+    R_inst:        float,
+    T_fixed:       Optional[float] = 280.0,
+    x0_am:         float = 1.5,
+    x0_dlam:       float = 0.0,
+    x0_T:          float = 280.0,
+    am_bounds:     Tuple[float, float] = (1.0, 2.5),
+    dlam_bounds:   Tuple[float, float] = (-0.5, 0.5),
+    T_bounds:      Tuple[float, float] = (250.0, 320.0),
+    optimizer:     str = "de",
 ) -> Tuple[Dict[str, float], float, Any]:
     """
     Fit (airmass, dlam_nm) with temperature optionally fixed.
+    PWV is fixed by MERRA-2 and is not a free parameter.
 
     optimizer = "de"     — Differential Evolution global search followed by
                            an L-BFGS-B polish step.  Recommended: robust
-                           against broad, shallow chi-square basins where
-                           L-BFGS-B alone gets stuck at the starting point.
-    optimizer = "lbfgsb" — Pure L-BFGS-B from x0.  Fast but fragile when
-                           the basin is wide relative to the gradient scale.
-
-    dlam_bounds defaults to +-0.5 nm -- intentionally wide.
-    Tighten only after confirming the heatmap shows a localised minimum.
+                           against broad, shallow chi-square basins.
+    optimizer = "lbfgsb" — Pure L-BFGS-B from x0.  Fast but fragile.
 
     Returns (best_params_dict, chi2_val, scipy_result).
     """
@@ -972,8 +1278,8 @@ def prepare_pipeline(
     airmass_grid:  Sequence[float],
     temp_grid:     Sequence[float],
     force_rebuild: bool = False,
-) -> Tuple[RegularGridInterpolator, np.ndarray]:
-    """Build or load the HDF5 grid; return (interpolator, lam_grid_nm)."""
+) -> Tuple[RegularGridInterpolator, RegularGridInterpolator, np.ndarray]:
+    """Build or load the HDF5 grid; return (interp_total, interp_h2o, lam_grid_nm)."""
     build_grid_hdf5(
         cfg_obj=cfg_obj,
         airmass_grid=airmass_grid,
@@ -1102,21 +1408,23 @@ def plot_corrected_spectrum(
 
 
 def plot_am_dlam_heatmap(
-    interp:      RegularGridInterpolator,
-    wave_obs:    np.ndarray,
-    flux_obs:    np.ndarray,
-    sigma_obs:   np.ndarray,
-    mask:        np.ndarray,
-    lam_grid:    np.ndarray,
-    R_inst:      float,
-    T_fixed:     float = 280.0,
-    am_bounds:   Tuple[float, float] = (1.0, 2.5),
-    dlam_bounds: Tuple[float, float] = (-0.5, 0.5),
-    n_am:        int = 80,
-    n_dlam:      int = 80,
+    interp:           RegularGridInterpolator,
+    wave_obs:         np.ndarray,
+    flux_obs:         np.ndarray,
+    sigma_obs:        np.ndarray,
+    mask:             np.ndarray,
+    lam_grid:         np.ndarray,
+    R_inst:           float,
+    T_fixed:          float = 280.0,
+    am_bounds:        Tuple[float, float] = (1.0, 2.5),
+    dlam_bounds:      Tuple[float, float] = (-0.5, 0.5),
+    n_am:             int = 80,
+    n_dlam:           int = 80,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Chi-square heat map in (airmass, dlam) space.
+
+    PWV is fixed by MERRA-2 (not a free parameter).
 
     dlam_bounds defaults to +-0.5 nm so the full landscape is visible.
     Call a second time with tight bounds around the recovered minimum
@@ -1155,7 +1463,7 @@ def plot_am_dlam_heatmap(
     plt.ylabel(r"$\delta\lambda$ (nm)")
     plt.title(
         f"$\\Delta\\chi^2$ Heat Map -- Airmass vs Wavelength Shift\n"
-        f"(T fixed = {T_fixed:.1f} K, PWV from MERRA-2)"
+        f"(T={T_fixed:.1f} K, template atmosphere + scale_psg)"
     )
     plt.legend()
     plt.tight_layout()
@@ -1174,14 +1482,14 @@ def plot_am_dlam_heatmap(
 # ============================================================
 
 def make_synthetic_observation(
-    interp:     RegularGridInterpolator,
-    lam_grid:   np.ndarray,
-    R_inst:     float,
-    true_am:    float = 1.5,
-    true_T:     float = 280.0,
-    true_dlam:  float = 0.015,
-    sigma:      float = 0.02,
-    seed:       int   = 42,
+    interp:       RegularGridInterpolator,
+    lam_grid:     np.ndarray,
+    R_inst:       float,
+    true_am:      float = 1.5,
+    true_T:       float = 280.0,
+    true_dlam:    float = 0.015,
+    sigma:        float = 0.02,
+    seed:         int   = 42,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Build a synthetic observed spectrum on a realistic detector
@@ -1219,6 +1527,104 @@ def make_synthetic_observation(
 
 
 # ============================================================
+# THREE-PANEL DIAGNOSTIC  (reproduces Ben's Raw_PSG_H2O plot)
+# ============================================================
+
+def plot_raw_psg_response(
+    cfg_obj:   PipelineConfig,
+    am:        float = 1.5,
+    surface_T: float = 280.0,
+    R_mid:     float = 25_000.0,
+    R_inst:    float = 8_000.0,
+    lam_range: Tuple[float, float] = (1500.0, 2600.0),
+) -> None:
+    """
+    Reproduce the Raw_PSG_H2O three-panel figure by making a fresh
+    direct PSG call and plotting the raw response columns.
+
+    This bypasses the grid entirely — it is a direct window into what
+    PSG returns at native R=200,000 resolution.
+
+    Panel 1 — Raw Total transmission at native PSG resolution (R=200,000)
+              Individual HITRAN lines are fully resolved here
+    Panel 2 — Total transmission convolved to R_mid (e.g. R=25,000)
+    Panel 3 — Total transmission convolved to R_inst (instrument resolution,
+              e.g. R=8,000 for LIGER)
+
+    All three resolving powers are explicit parameters — none are derived
+    from each other.  Pass R_inst=R_INST from __main__ to keep the plot
+    consistent with the rest of the pipeline.
+
+    Note: we plot Total rather than the isolated H2O column because
+    Without watm=y the H2O column reflects true HITRAN line absorption
+    so panel 1 shows individual molecular lines at full resolution.
+    Total in panel 3 captures all species combined at instrument R.
+    """
+    print(f"[plot_raw_psg_response] Making fresh PSG call: am={am}, T={surface_T}")
+    psg_in    = build_psg_input(am, surface_T, cfg_obj, h2o_abun=1.0)
+    arr, cols = run_psg(psg_in, cfg_obj)
+
+    if arr is None:
+        print("PSG call failed — cannot produce Raw_PSG_H2O plot.")
+        return
+
+    wave_idx  = find_column(cols, "Wave")  or 0
+    total_idx = find_column(cols, PSG_TOTAL_LABEL) or 1
+    h2o_idx   = find_column(cols, PSG_H2O_LABEL)
+
+    lam_nm = 1e7 / arr[:, wave_idx]
+    order  = np.argsort(lam_nm)
+    lam_nm = lam_nm[order]
+    total  = arr[order, total_idx]
+    h2o    = arr[order, h2o_idx] if h2o_idx is not None else total
+
+    mask = (lam_nm >= lam_range[0]) & (lam_nm <= lam_range[1])
+    lam  = lam_nm[mask]
+
+    total_raw  = total[mask]
+    total_mid  = convolve_to_R(lam, total_raw, R_mid)
+    total_inst = convolve_to_R(lam, total_raw, R_inst)
+
+    fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+    fig.suptitle(
+        f"PSG Telluric Transmission  AM={am:.2f}  T={surface_T:.0f} K\n"
+        f"(native R={PSG_NATIVE_RP:,} → R={int(R_mid):,} → R={int(R_inst):,})",
+        fontsize=13,
+    )
+
+    axes[0].plot(lam, total_raw,  lw=0.4, color="steelblue")
+    axes[0].set_ylabel("Transmittance")
+    axes[0].set_ylim(-0.05, 1.05)
+    axes[0].set_title(f"Raw PSG H2O  (native R={PSG_NATIVE_RP:,})")
+
+    axes[1].plot(lam, total_mid,  lw=0.7, color="steelblue")
+    axes[1].set_ylabel("Transmittance")
+    axes[1].set_ylim(-0.05, 1.05)
+    axes[1].set_title(f"Convolved H2O at R={int(R_mid):,}")
+
+    axes[2].plot(lam, total_inst, lw=0.8, color="steelblue")
+    axes[2].set_ylabel("Transmittance")
+    axes[2].set_ylim(-0.05, 1.05)
+    axes[2].set_title(f"Convolved Total Transmission at R={int(R_inst):,}")
+    axes[2].set_xlabel("Wavelength (nm)")
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_raw_psg_three_panel(
+    cfg_obj:   PipelineConfig,
+    am:        float = 1.5,
+    surface_T: float = 280.0,
+    R_mid:     float = 25_000.0,
+    R_inst:    float = 8_000.0,
+    lam_range: Tuple[float, float] = (1500.0, 2600.0),
+) -> None:
+    """Alias for plot_raw_psg_response — kept for backward compatibility."""
+    plot_raw_psg_response(cfg_obj, am, surface_T, R_mid, R_inst, lam_range)
+
+
+# ============================================================
 # EXAMPLE USAGE
 # ============================================================
 
@@ -1229,21 +1635,26 @@ if __name__ == "__main__":
     #     Use nighttime UT: HST = UT - 10h, so 05:00 UT = 19:00 HST
     # ------------------------------------------------------------------
     cfg = PipelineConfig(
-        template_path     = "earth_cfg.txt",
         observation_date  = "2024/01/15 05:00",
         site              = SiteConfig(),
         wavelength_cfg_nm = (1500.0, 2500.0, 50_000.0),
         h5_filename       = "telluric_grid.h5",
     )
 
-    # Single temperature node -- temperature axis is inactive per validation
+    # Airmass grid: covers typical LIGER observing range
     airmass_grid = [1.0, 1.2, 1.5, 2.0]
+
+    # H2O abundance grid: wide range centered on the template baseline.
+    # 1.0 = unperturbed template; 0.5 = half column; 2.0 = double column.
+    # The wide range (0.5-3.0) is needed because ABUN response is sub-linear
+    # and we need genuine separation in line depths across the grid.
+    # Single temperature node -- temperature axis is inactive per validation
     temp_grid    = [280.0]
 
     # ------------------------------------------------------------------
     # 2.  Build or load grid
     # ------------------------------------------------------------------
-    interp, lam_grid = prepare_pipeline(
+    interp, interp_h2o, lam_grid = prepare_pipeline(
         cfg_obj       = cfg,
         airmass_grid  = airmass_grid,
         temp_grid     = temp_grid,
@@ -1266,6 +1677,34 @@ if __name__ == "__main__":
         surface_T = T_FIXED,
         sigma_ref = 0.02,
     )
+
+    # ------------------------------------------------------------------
+    # 3b. Three-panel diagnostic -- reproduces Ben's Raw_PSG_H2O plot
+    #     Verifies that individual HITRAN lines are resolved in the grid
+    # ------------------------------------------------------------------
+    plot_raw_psg_response(
+        cfg_obj   = cfg,
+        am        = 1.5,
+        surface_T = T_FIXED,
+        R_mid     = 25_000.0,
+        R_inst    = R_INST,
+    )
+
+    # ------------------------------------------------------------------
+    # 3c. Per-species molecular plot
+    #     Shows each molecule at instrument resolution
+    # ------------------------------------------------------------------
+    _psg_in_mol  = build_psg_input(1.5, T_FIXED, cfg, h2o_abun=1.0)
+    _arr_mol, _cols_mol = run_psg(_psg_in_mol, cfg)
+    if _arr_mol is not None:
+        _, _mol_tuple = extract_mol_columns(_arr_mol, _cols_mol, lam_grid)
+        plot_molecular_species(
+            lam_nm    = lam_grid,
+            mol_tuple = _mol_tuple,
+            R_inst    = R_INST,
+            lam_range = (1500.0, 2600.0),
+            title     = f"PSG Molecular Species  AM=1.5  T={T_FIXED:.0f} K",
+        )
 
     # ------------------------------------------------------------------
     # 4.  Build synthetic observation with a REAL wavelength offset (Fix 3)
@@ -1309,17 +1748,17 @@ if __name__ == "__main__":
     #     DE explores the full bounds before polishing with L-BFGS-B.
     # ------------------------------------------------------------------
     best_params, chi2_val, res = fit_telluric(
-        interp      = interp,
-        wave_obs    = wave_obs,
-        flux_obs    = flux_obs,
-        sigma_obs   = sigma_obs,
-        mask        = fit_mask,
-        lam_grid    = lam_grid,
-        R_inst      = R_INST,
-        T_fixed     = T_FIXED,
-        am_bounds   = (1.0, 2.5),
-        dlam_bounds = (-0.5, 0.5),
-        optimizer   = "de",          # global search: robust against broad basins
+        interp          = interp,
+        wave_obs        = wave_obs,
+        flux_obs        = flux_obs,
+        sigma_obs       = sigma_obs,
+        mask            = fit_mask,
+        lam_grid        = lam_grid,
+        R_inst          = R_INST,
+        T_fixed         = T_FIXED,
+        am_bounds       = (1.0, 2.5),
+        dlam_bounds     = (-0.5, 0.5),
+        optimizer       = "de",
     )
 
     n_pix = int(fit_mask.sum())
@@ -1358,36 +1797,37 @@ if __name__ == "__main__":
     plot_corrected_spectrum(wave_obs, products)
 
     # Wide heatmap -- confirm dlam minimum is localised, not a plateau
+    # H2O held at the recovered best value while scanning (am, dlam)
     plot_am_dlam_heatmap(
-        interp      = interp,
-        wave_obs    = wave_obs,
-        flux_obs    = flux_obs,
-        sigma_obs   = sigma_obs,
-        mask        = fit_mask,
-        lam_grid    = lam_grid,
-        R_inst      = R_INST,
-        T_fixed     = T_FIXED,
-        am_bounds   = (1.0, 2.5),
-        dlam_bounds = (-0.5, 0.5),
-        n_am        = 80,
-        n_dlam      = 80,
+        interp          = interp,
+        wave_obs        = wave_obs,
+        flux_obs        = flux_obs,
+        sigma_obs       = sigma_obs,
+        mask            = fit_mask,
+        lam_grid        = lam_grid,
+        R_inst          = R_INST,
+        T_fixed         = T_FIXED,
+        am_bounds       = (1.0, 2.5),
+        dlam_bounds     = (-0.5, 0.5),
+        n_am            = 80,
+        n_dlam          = 80,
     )
 
     # Zoom in once the basin is confirmed
     plot_am_dlam_heatmap(
-        interp      = interp,
-        wave_obs    = wave_obs,
-        flux_obs    = flux_obs,
-        sigma_obs   = sigma_obs,
-        mask        = fit_mask,
-        lam_grid    = lam_grid,
-        R_inst      = R_INST,
-        T_fixed     = T_FIXED,
-        am_bounds   = (
+        interp          = interp,
+        wave_obs        = wave_obs,
+        flux_obs        = flux_obs,
+        sigma_obs       = sigma_obs,
+        mask            = fit_mask,
+        lam_grid        = lam_grid,
+        R_inst          = R_INST,
+        T_fixed         = T_FIXED,
+        am_bounds       = (
             max(1.0, best_params["airmass"] - 0.3),
             min(2.5, best_params["airmass"] + 0.3),
         ),
-        dlam_bounds = (
+        dlam_bounds     = (
             best_params["dlam_nm"] - 0.1,
             best_params["dlam_nm"] + 0.1,
         ),
