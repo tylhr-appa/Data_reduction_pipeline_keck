@@ -14,7 +14,19 @@ import hashlib
 # ============================================================
 
 PSG_API       = "https://psg.gsfc.nasa.gov/api.php"
-TEMPLATE_PATH = "earth_cfg.txt"
+def _find_template(name="earth_cfg.txt"):
+    """Locate the PSG template, checking the script dir and Data_reduc_pipe/."""
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), name),
+        os.path.join("Data_reduc_pipe", name),
+        name,
+    ]
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    return name  # fall through to let load_psg_template raise a clear error
+
+TEMPLATE_PATH = _find_template()
 OUT_DIR       = "telluric_grid"
 
 # Force PSG into the user-controlled atmosphere mode (Option B).
