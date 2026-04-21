@@ -40,9 +40,6 @@ Key design choices
     rebuilding the grid after non-PSG code changes costs zero API calls.
 6.  Grid validity is keyed to (date, site, wavelength, airmass grid,
     temp grid) so any axis change invalidates stale grids.
-7.  The three-panel diagnostic plot reproduces the Raw_PSG_H2O figure
-    showing Total transmission at native, intermediate, and instrument
-    resolving power.
 """
 
 from __future__ import annotations
@@ -247,9 +244,9 @@ def scale_h2o_transmission(
     return np.clip(T_h2o_scaled * T_other, 0.0, 1.0)
 
 
-# ============================================================
-# SCALE_PSG  — per-species Beer-Lambert scaling (Ben's method)
-# ============================================================
+# =============================================
+# SCALE_PSG  — per-species Beer-Lambert scaling
+# =============================================
 
 PSG_MOL_LABELS = ("H2O", "CO2", "CH4", "CO", "O3", "N2O", "O2")
 
@@ -330,37 +327,35 @@ def extract_mol_columns(
     return lam_ref, mol_tuple
 
 
-def plot_molecular_species(
+def plot_molecular_species_overlay(
     lam_nm:    np.ndarray,
     mol_tuple: Tuple[np.ndarray, ...],
+    airmass:   float,
     R_inst:    float = 8_000.0,
     lam_range: Tuple[float, float] = (1500.0, 2600.0),
     title:     str = "PSG Molecular Species",
 ) -> None:
-    """Plot each molecular species transmission on its own panel."""
+    """
+    Overlay per-species transmission on a single panel at the given
+    airmass.  mol_tuple is expected at am=1.0; Beer-Lambert scaling
+    T**airmass is applied per species before convolution.
+    """
     mask = (lam_nm >= lam_range[0]) & (lam_nm <= lam_range[1])
     lam  = lam_nm[mask]
 
-    fig, axes = plt.subplots(
-        len(PSG_MOL_LABELS), 1,
-        figsize=(14, 2.8 * len(PSG_MOL_LABELS)),
-        sharex=True,
-    )
-    fig.suptitle(
-        f"{title}  (convolved R={int(R_inst):,})",
-        fontsize=13,
-    )
-
-    for ax, label, spec in zip(axes, PSG_MOL_LABELS, mol_tuple):
-        spec_conv = convolve_to_R(lam, spec[mask], R_inst)
+    plt.figure(figsize=(14, 6))
+    for label, spec_base in zip(PSG_MOL_LABELS, mol_tuple):
+        spec_am   = np.clip(spec_base, 1e-30, 1.0) ** float(airmass)
+        spec_conv = convolve_to_R(lam, spec_am[mask], R_inst)
         color     = PSG_MOL_COLORS.get(label, "steelblue")
-        ax.plot(lam, spec_conv, lw=0.8, color=color)
-        ax.set_ylabel("Trans.")
-        ax.set_ylim(-0.05, 1.05)
-        ax.set_title(label)
-        ax.grid(True, alpha=0.2)
+        plt.plot(lam, spec_conv, lw=0.9, color=color, label=label)
 
-    axes[-1].set_xlabel("Wavelength (nm)")
+    plt.xlabel("Wavelength (nm)")
+    plt.ylabel("Transmission")
+    plt.ylim(-0.05, 1.05)
+    plt.title(f"{title}  AM={airmass:.3f}  R={int(R_inst):,}")
+    plt.legend(ncol=len(PSG_MOL_LABELS), loc="lower center", fontsize=9)
+    plt.grid(True, alpha=0.2)
     plt.tight_layout()
     plt.show()
 
@@ -605,6 +600,21 @@ def _cache_path(
     )
 
 
+def _cols_path(dat_path: str) -> str:
+    return dat_path + ".cols"
+
+
+def _save_cols(path: str, col_names: Sequence[str]) -> None:
+    with open(path, "w") as fh:
+        fh.write(",".join(col_names) + "\n")
+
+
+def _load_cols(path: str) -> List[str]:
+    with open(path) as fh:
+        line = fh.readline().strip()
+    return [c for c in line.split(",") if c]
+
+
 # ============================================================
 # GRID BUILDER
 # ============================================================
@@ -649,18 +659,31 @@ def build_grid_hdf5(
         psg_in   = build_psg_input(1.0, surface_T, cfg_obj, h2o_abun=1.0)
         cfg_hash = _stable_cfg_hash(psg_in)
         p        = _cache_path(cfg_obj.out_dir, 1.0, 1.0, surface_T, cfg_hash)
-        if (not force_rebuild) and os.path.exists(p) and os.path.getsize(p) > 0:
+        cp       = _cols_path(p)
+        # Cache hit requires both the data file and the sidecar column
+        # list, since extract_mol_columns relies on named columns to
+        # pick out each molecular species.  A legacy .dat without a
+        # sidecar is treated as a miss and refetched to repopulate.
+        have_cache = (
+            (not force_rebuild)
+            and os.path.exists(p)  and os.path.getsize(p)  > 0
+            and os.path.exists(cp) and os.path.getsize(cp) > 0
+        )
+        if have_cache:
             print(f"  [cache] base T={surface_T:.1f} -> {p}")
             try:
-                arr = np.loadtxt(p)
-                if arr.ndim == 2 and arr.shape[1] >= 2:
-                    return arr, []
+                arr  = np.loadtxt(p)
+                cols = _load_cols(cp)
+                if arr.ndim == 2 and arr.shape[1] >= 2 and cols:
+                    return arr, cols
             except Exception as exc:
                 print(f"  [cache] read failed ({exc}), recomputing")
         arr, col_names = run_psg(psg_in, cfg_obj)
         if arr is None:
             raise RuntimeError(f"PSG returned no data for T={surface_T}")
         np.savetxt(p, arr)
+        if col_names:
+            _save_cols(cp, col_names)
         return arr, col_names
 
     # Reference wavelength grid from first temperature node
@@ -1360,7 +1383,7 @@ def make_synthetic_observation(
 
 
 # ============================================================
-# THREE-PANEL DIAGNOSTIC (Raw_PSG_H2O plot)
+# THREE-PANEL DIAGNOSTIC
 # ============================================================
 
 def plot_raw_psg_response(
@@ -1441,6 +1464,12 @@ if __name__ == "__main__":
 
     # ----------------------------------------------------------
     # 1.  Configure the pipeline
+    #     Sets the observation date, observatory site, wavelength
+    #     range, and the HDF5 file where the transmission grid is
+    #     cached.  The airmass_grid defines the nodes along which
+    #     Beer-Lambert scaling interpolates; temp_grid is collapsed
+    #     to a single value since surface T has negligible effect
+    #     on telluric transmission in this band.
     # ----------------------------------------------------------
     cfg = PipelineConfig(
         observation_date  = "2024/01/15 05:00",
@@ -1454,6 +1483,11 @@ if __name__ == "__main__":
 
     # ----------------------------------------------------------
     # 2.  Build or load grid
+    #     One PSG API call per temperature node at airmass=1.0;
+    #     the airmass axis is filled analytically via Beer-Lambert
+    #     scaling (scale_psg).  Returns interpolators over
+    #     (airmass, surface_T) for total and H2O transmission, plus
+    #     the reference wavelength grid in nm.
     # ----------------------------------------------------------
     interp, interp_h2o, lam_grid = prepare_pipeline(
         cfg_obj       = cfg,
@@ -1467,6 +1501,11 @@ if __name__ == "__main__":
 
     # ----------------------------------------------------------
     # 3.  Forward model round-trip check
+    #     Sanity check: evaluate the forward model at dlam=0 and
+    #     compare against the raw interpolated spectrum.  Residuals
+    #     should be well below the observational noise floor, which
+    #     confirms that convolution + resampling do not distort the
+    #     model.
     # ----------------------------------------------------------
     roundtrip = check_forward_model_roundtrip(
         interp    = interp,
@@ -1479,6 +1518,10 @@ if __name__ == "__main__":
 
     # ----------------------------------------------------------
     # 3b. Three-panel diagnostic
+    #     Fresh PSG call plotted at native resolution, an
+    #     intermediate R, and the instrument R.  Useful for
+    #     visualizing how high-resolution HITRAN line structure
+    #     gets smoothed down to what the detector actually sees.
     # ----------------------------------------------------------
     plot_raw_psg_response(
         cfg_obj   = cfg,
@@ -1489,22 +1532,12 @@ if __name__ == "__main__":
     )
 
     # ----------------------------------------------------------
-    # 3c. Per-species molecular plot
-    # ----------------------------------------------------------
-    _psg_in_mol  = build_psg_input(1.5, T_FIXED, cfg, h2o_abun=1.0)
-    _arr_mol, _cols_mol = run_psg(_psg_in_mol, cfg)
-    if _arr_mol is not None:
-        _, _mol_tuple = extract_mol_columns(_arr_mol, _cols_mol, lam_grid)
-        plot_molecular_species(
-            lam_nm    = lam_grid,
-            mol_tuple = _mol_tuple,
-            R_inst    = R_INST,
-            lam_range = (1500.0, 2600.0),
-            title     = f"PSG Molecular Species  AM=1.5  T={T_FIXED:.0f} K",
-        )
-
-    # ----------------------------------------------------------
     # 4.  Synthetic observation with real wavelength offset
+    #     Generates a mock spectrum at known (airmass, T, dlam)
+    #     with Gaussian noise.  The detector wavelength grid is
+    #     offset from the model grid by true_dlam so the fit must
+    #     actually recover a real sub-pixel shift — this is the
+    #     smoke test the fitter is graded against.
     # ----------------------------------------------------------
     true_am   = 1.5
     true_T    = T_FIXED
@@ -1522,6 +1555,10 @@ if __name__ == "__main__":
 
     # ----------------------------------------------------------
     # 5.  Fit window
+    #     Restricts the chi-square to a wavelength region with
+    #     usable transmission structure (not fully saturated, not
+    #     fully clear).  check_fit_window prints statistics and
+    #     warns if the window is too opaque to constrain airmass.
     # ----------------------------------------------------------
     fit_mask = (
         np.isfinite(wave_obs)
@@ -1539,6 +1576,10 @@ if __name__ == "__main__":
 
     # ----------------------------------------------------------
     # 6.  Fit with Differential Evolution
+    #     Global optimizer over (airmass, dlam_nm) with T held
+    #     fixed.  DE is used rather than a local method because
+    #     the chi-square surface has broad, shallow basins where
+    #     gradient descent is unreliable.
     # ----------------------------------------------------------
     best_params, chi2_val, res = fit_telluric(
         interp          = interp,
@@ -1566,6 +1607,9 @@ if __name__ == "__main__":
 
     # ----------------------------------------------------------
     # 7.  Apply correction
+    #     Divides the observed flux by the best-fit telluric model
+    #     (with floor to avoid blow-ups near saturated lines) to
+    #     produce the corrected spectrum and propagated errors.
     # ----------------------------------------------------------
     products = apply_telluric_correction(
         best_params = best_params,
@@ -1580,11 +1624,37 @@ if __name__ == "__main__":
 
     # ----------------------------------------------------------
     # 8.  Diagnostic plots
+    #     Transmission vs airmass, best-fit overlay, corrected
+    #     spectrum, and two chi-square heat maps in (airmass, dlam)
+    #     space — one coarse over the full bounds, one zoomed
+    #     around the fitted optimum to visualize parameter
+    #     degeneracies and the depth of the chi-square minimum.
     # ----------------------------------------------------------
     plot_vs_airmass(interp, lam_grid, surface_T=T_FIXED)
     plot_vs_airmass(interp, lam_grid, surface_T=T_FIXED, lam_range=(1550.0, 1750.0))
     plot_best_fit(wave_obs, flux_obs, sigma_obs, interp, lam_grid, best_params, R_INST)
     plot_corrected_spectrum(wave_obs, products)
+
+    # ----------------------------------------------------------
+    # 8b. Per-species overlay at the recovered airmass
+    #     PSG call at am=1.0 to extract per-species base columns,
+    #     then Beer-Lambert scaled to the fitted airmass so the
+    #     plot reflects the actual atmosphere the fit converged on.
+    #     One axis, all species overlaid — shows which molecules
+    #     dominate each wavelength region at the recovered AM.
+    # ----------------------------------------------------------
+    _psg_in_mol  = build_psg_input(1.0, T_FIXED, cfg, h2o_abun=1.0)
+    _arr_mol, _cols_mol = run_psg(_psg_in_mol, cfg)
+    if _arr_mol is not None:
+        _, _mol_tuple = extract_mol_columns(_arr_mol, _cols_mol, lam_grid)
+        plot_molecular_species_overlay(
+            lam_nm    = lam_grid,
+            mol_tuple = _mol_tuple,
+            airmass   = best_params["airmass"],
+            R_inst    = R_INST,
+            lam_range = (1500.0, 2600.0),
+            title     = f"Per-Species Transmission at Best-Fit  T={T_FIXED:.0f} K",
+        )
 
     plot_am_dlam_heatmap(
         interp=interp, wave_obs=wave_obs, flux_obs=flux_obs,
