@@ -1,0 +1,26 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Hubble constant in s^-1
+H0 = 68 / (3.086e19)
+
+# Omega range (avoid exactly 1 to prevent division issues)
+Omega = np.linspace(1.001, 3, 500)
+
+# Function
+f = (Omega / (2 * (Omega - 1)**1.5)) * \
+    np.arccos((2 - Omega)/Omega) - \
+    1/(Omega - 1)
+
+# Age in seconds
+t0 = f / H0
+
+# Convert to Gyr
+t0_gyr = t0 / (3.156e16)
+
+plt.plot(Omega, t0_gyr)
+plt.xlabel(r'$\Omega_0$')
+plt.ylabel(r'$t_0$ (Gyr)')
+plt.title('Age of Universe vs $\Omega_0$ (Closed, Matter-only)')
+plt.grid()
+plt.show()
