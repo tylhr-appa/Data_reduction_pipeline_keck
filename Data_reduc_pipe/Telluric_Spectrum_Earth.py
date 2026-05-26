@@ -682,6 +682,175 @@ def fetch_stitched_spectrum(
 
 
 # ============================================================
+# AVERAGE PSG MODEL — FITS EXPORT AND LOADER
+# ============================================================
+
+# Column names written to and read from the average PSG FITS file.
+# Order matches the KPIC open_psg_allmol convention so the same
+# scale_psg function works with both pipelines.
+PSG_FITS_COLS = ("Wave/freq", "H2O", "CO2", "CH4", "CO", "O3", "N2O", "O2")
+
+
+def save_average_psg_model(
+    cfg_obj:   PipelineConfig,
+    fits_path: str,
+    am:        float = 1.0,
+    surface_T: float = 280.0,
+    h2o_abun:  float = 1.0,
+    force_rebuild: bool = False,
+) -> str:
+    """
+    Generate and save the average PSG telluric model as a FITS binary
+    table.
+
+    This is a one-time offline step.  The resulting file is loaded at
+    runtime by load_average_psg_model() instead of calling PSG live,
+    which is what the DRP primitive requires.
+
+    The FITS table has one column per species in PSG_FITS_COLS.
+    Wavelengths are stored in nm (ascending).  The per-species columns
+    are the raw PSG transmission values at am=1.0 before any
+    Beer-Lambert scaling — scale_psg applies the scaling at fit time.
+
+    Parameters
+    ----------
+    cfg_obj   : PipelineConfig controlling wavelength range and PSG settings
+    fits_path : output path for the FITS file
+    am        : airmass for the PSG call (should be 1.0 for the base model)
+    surface_T : surface temperature in K
+    h2o_abun  : H2O abundance scaling (1.0 = template default)
+    force_rebuild : if True, re-fetch from PSG even if fits_path exists
+
+    Returns
+    -------
+    fits_path : path to the written FITS file
+    """
+    import astropy.io.fits as fits
+
+    if not force_rebuild and os.path.exists(fits_path):
+        print(f"[psg_fits] Average model already exists: {fits_path}")
+        return fits_path
+
+    print(f"[psg_fits] Generating average PSG model -> {fits_path}")
+    arr, cols = fetch_stitched_spectrum(
+        am=am,
+        surface_T=surface_T,
+        cfg_obj=cfg_obj,
+        h2o_abun=h2o_abun,
+        force_rebuild=force_rebuild,
+    )
+    if arr is None:
+        raise RuntimeError("PSG fetch failed — cannot write average model FITS.")
+
+    # Convert wavelength column to nm and sort ascending
+    wave_idx = find_column(cols, "Wave") or 0
+    lam_nm   = _wave_col_to_nm(arr[:, wave_idx])
+    order    = np.argsort(lam_nm)
+    lam_nm   = lam_nm[order]
+
+    # Build one FITS column per species
+    fits_columns = [
+        fits.Column(name="Wave/freq", format="D", unit="nm", array=lam_nm)
+    ]
+    for label in PSG_MOL_LABELS:
+        idx = find_column(cols, label)
+        if idx is None:
+            print(f"  [psg_fits] WARNING: {label} not found in PSG response, "
+                  f"filling with ones")
+            data = np.ones(len(lam_nm))
+        else:
+            data = np.nan_to_num(arr[order, idx].astype(float), nan=1.0)
+        fits_columns.append(
+            fits.Column(name=label, format="D", array=data)
+        )
+
+    hdu   = fits.BinTableHDU.from_columns(fits_columns)
+    phdu  = fits.PrimaryHDU()
+
+    # Store metadata in the primary header
+    phdu.header["OBSDATE"]  = (cfg_obj.observation_date, "PSG observation date")
+    phdu.header["SITE"]     = (cfg_obj.site.name,        "Observatory site")
+    phdu.header["SITELAT"]  = (cfg_obj.site.latitude_deg,  "Site latitude deg N")
+    phdu.header["SITELON"]  = (cfg_obj.site.longitude_deg, "Site longitude deg E")
+    phdu.header["SITEALT"]  = (cfg_obj.site.altitude_km,   "Site altitude km")
+    phdu.header["LAM_MIN"]  = (cfg_obj.wavelength_range_nm[0], "Wavelength min nm")
+    phdu.header["LAM_MAX"]  = (cfg_obj.wavelength_range_nm[1], "Wavelength max nm")
+    phdu.header["AIRMASS"]  = (am,        "Airmass of base PSG call")
+    phdu.header["SURF_T"]   = (surface_T, "Surface temperature K")
+    phdu.header["H2O_ABUN"] = (h2o_abun,  "H2O abundance scaling")
+    phdu.header["NPTS"]     = (len(lam_nm), "Number of wavelength points")
+    phdu.header["COMMENT"]  = "Average PSG telluric model for HISPEC/LIGER"
+    phdu.header["COMMENT"]  = "Per-species columns are raw PSG transmission at am=1.0"
+    phdu.header["COMMENT"]  = "Apply Beer-Lambert scaling via scale_psg()"
+
+    hdulist = fits.HDUList([phdu, hdu])
+    hdulist.writeto(fits_path, overwrite=True)
+    print(
+        f"[psg_fits] Wrote {fits_path}  "
+        f"({len(lam_nm)} pts, "
+        f"{cfg_obj.wavelength_range_nm[0]:.0f}-"
+        f"{cfg_obj.wavelength_range_nm[1]:.0f} nm)"
+    )
+    return fits_path
+
+
+def load_average_psg_model(
+    fits_path: str,
+    l0: Optional[float] = None,
+    l1: Optional[float] = None,
+) -> Tuple[np.ndarray, Tuple[np.ndarray, ...]]:
+    """
+    Load the average PSG telluric model from a FITS file.
+
+    Equivalent to KPIC's open_psg_allmol but reads from the FITS
+    format written by save_average_psg_model.
+
+    Parameters
+    ----------
+    fits_path : path to the FITS file written by save_average_psg_model
+    l0        : lower wavelength bound in nm (None = use full range)
+    l1        : upper wavelength bound in nm (None = use full range)
+
+    Returns
+    -------
+    lam_nm    : (N,) wavelength array in nm
+    psg_tuple : (H2O, CO2, CH4, CO, O3, N2O, O2) transmission arrays
+                ready to pass directly to scale_psg()
+    """
+    import astropy.io.fits as fits
+
+    if not os.path.exists(fits_path):
+        raise FileNotFoundError(
+            f"Average PSG model not found: {fits_path}\n"
+            "Run save_average_psg_model() to generate it."
+        )
+
+    with fits.open(fits_path) as hdulist:
+        table = hdulist[1].data
+        lam_nm = table["Wave/freq"].astype(float)
+        mol_arrays = tuple(
+            table[label].astype(float) for label in PSG_MOL_LABELS
+        )
+
+    # Trim to requested wavelength range
+    mask = np.ones(len(lam_nm), bool)
+    if l0 is not None:
+        mask &= (lam_nm >= l0)
+    if l1 is not None:
+        mask &= (lam_nm <= l1)
+
+    lam_nm    = lam_nm[mask]
+    psg_tuple = tuple(arr[mask] for arr in mol_arrays)
+
+    print(
+        f"[psg_fits] Loaded {fits_path}  "
+        f"({len(lam_nm)} pts, "
+        f"{lam_nm.min():.1f}-{lam_nm.max():.1f} nm)"
+    )
+    return lam_nm, psg_tuple
+
+
+# ============================================================
 # GRID CACHING
 # ============================================================
 
@@ -1032,6 +1201,535 @@ def prepare_pipeline(cfg_obj, airmass_grid, temp_grid, force_rebuild=False):
     return make_telluric_interp(cfg_obj.h5_filename)
 
 
+
+
+# ============================================================
+# TELLURIC PRIMITIVE — DRP-FACING APPLY FUNCTION
+# ============================================================
+
+# Known FITS header keywords for airmass across Keck instruments.
+# The list is checked in order; the first match wins.
+AIRMASS_HEADER_KEYS = ("AIRMASS", "AMSTART", "AMEND", "MEAN_AM", "HIERARCH ESO TEL AIRM START")
+
+
+def _read_airmass_from_header(header: dict) -> Optional[float]:
+    """
+    Try to read airmass from a FITS header dict.
+
+    Checks AIRMASS_HEADER_KEYS in order and returns the first valid
+    positive float found.  Returns None if no valid airmass keyword
+    is present.
+    """
+    for key in AIRMASS_HEADER_KEYS:
+        val = header.get(key)
+        if val is not None:
+            try:
+                am = float(val)
+                if am > 0:
+                    return am
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def apply_telluric_primitive(
+    wave_obs:       np.ndarray,
+    flux_obs:       np.ndarray,
+    sigma_obs:      np.ndarray,
+    model_fits:     str,
+    output_fits:    str,
+    header:         Optional[dict] = None,
+    airmass:        Optional[float] = None,
+    pwv:            float = 0.0,
+    fit_airmass:    bool = False,
+    fit_mask:       Optional[np.ndarray] = None,
+    am_bounds:      Tuple[float, float] = (1.0, 2.5),
+    l0:             Optional[float] = None,
+    l1:             Optional[float] = None,
+    telluric_floor: float = 1e-6,
+) -> Dict[str, np.ndarray]:
+    """
+    Apply telluric correction using a pre-generated average PSG model.
+
+    This is the DRP-facing function.  It loads the static average PSG
+    FITS model, scales it to the observation airmass, divides it from
+    the observed spectrum, and writes the corrected spectrum plus the
+    telluric model to a FITS output file.
+
+    Airmass resolution
+    ------------------
+    If fit_airmass=False (default):
+        1.  FITS header  (if header is provided and contains a valid AIRMASS key)
+        2.  airmass parameter  (explicit override)
+        3.  Raises ValueError if neither is available
+
+    If fit_airmass=True:
+        The header or airmass parameter is used as the starting point
+        for a Differential Evolution search over am_bounds.  The fitted
+        value replaces the header value.  PWV is kept fixed (not fitted)
+        to avoid the airmass-PWV degeneracy.
+
+    Parameters
+    ----------
+    wave_obs       : (N,) wavelength array in nm
+    flux_obs       : (N,) observed flux array
+    sigma_obs      : (N,) per-pixel uncertainty array
+    model_fits     : path to the average PSG model FITS file produced
+                     by save_average_psg_model()
+    output_fits    : path for the output FITS file
+    header         : FITS header dict from the input observation
+                     (used to read airmass and copy metadata)
+    airmass        : starting airmass; used directly when fit_airmass=False,
+                     or as a fallback x0 when fit_airmass=True and no
+                     valid header airmass is found
+    pwv            : PWV perturbation passed to scale_psg()
+                     (0.0 = unperturbed template column, never fitted)
+    fit_airmass    : if True, optimize airmass against the spectral data
+                     rather than using the header value directly
+    fit_mask       : boolean array selecting pixels used for fitting
+                     (None = use all finite pixels in [l0, l1])
+    am_bounds      : (min, max) search bounds for airmass when fitting
+    l0             : lower wavelength trim bound in nm (None = no trim)
+    l1             : upper wavelength trim bound in nm (None = no trim)
+    telluric_floor : minimum telluric transmission before division to
+                     avoid blowing up near saturated lines
+
+    Returns
+    -------
+    dict with keys:
+        corrected_flux   : telluric-corrected flux
+        corrected_sigma  : propagated uncertainties
+        telluric_model   : telluric transmission spectrum on wave_obs grid
+        airmass_used     : airmass value that was applied
+        airmass_fitted   : True if airmass was fitted, False if taken from header
+    """
+    import astropy.io.fits as fits
+
+    # ----------------------------------------------------------
+    # 1.  Resolve starting airmass
+    # ----------------------------------------------------------
+    am_init = None
+    if header is not None:
+        am_init = _read_airmass_from_header(header)
+        if am_init is not None:
+            print(f"[primitive] Airmass from FITS header: {am_init:.4f}")
+
+    if am_init is None and airmass is not None:
+        am_init = float(airmass)
+        print(f"[primitive] Airmass from parameter: {am_init:.4f}")
+
+    if am_init is None and not fit_airmass:
+        raise ValueError(
+            "No airmass available.  Provide a FITS header with an AIRMASS "
+            "keyword, pass airmass= explicitly, or set fit_airmass=True."
+        )
+
+    # If fitting without a starting point, use the midpoint of am_bounds
+    if am_init is None:
+        am_init = float(np.mean(am_bounds))
+        print(f"[primitive] No header airmass — using am_bounds midpoint "
+              f"as x0: {am_init:.4f}")
+
+    # ----------------------------------------------------------
+    # 2.  Load average PSG model and trim to requested range
+    # ----------------------------------------------------------
+    lam_model, psg_tuple = load_average_psg_model(
+        fits_path = model_fits,
+        l0        = l0,
+        l1        = l1,
+    )
+
+    # ----------------------------------------------------------
+    # 3.  Fit airmass if requested
+    #     PWV is held fixed — fitting both simultaneously is
+    #     unreliable due to the airmass-PWV degeneracy.
+    # ----------------------------------------------------------
+    airmass_fitted = False
+
+    if fit_airmass:
+        # Build the fit mask from finite pixels in the trim range
+        if fit_mask is None:
+            fit_mask_use = np.isfinite(flux_obs) & np.isfinite(sigma_obs)
+            if l0 is not None:
+                fit_mask_use &= (wave_obs >= l0)
+            if l1 is not None:
+                fit_mask_use &= (wave_obs <= l1)
+        else:
+            fit_mask_use = np.asarray(fit_mask, bool)
+
+        def _chi2_am(params):
+            """Chi-square over airmass only; PWV fixed."""
+            am_try = float(params[0])
+            tel_native = scale_psg(psg_tuple, airmass=am_try, pwv=pwv)
+            tel_on_obs = np.interp(
+                wave_obs, lam_model, tel_native,
+                left=np.nan, right=np.nan,
+            )
+            valid = (
+                fit_mask_use
+                & np.isfinite(tel_on_obs)
+                & np.isfinite(flux_obs)
+                & np.isfinite(sigma_obs)
+                & (sigma_obs > 0)
+                & (tel_on_obs > 0)
+            )
+            if valid.sum() < 50:
+                return 1e99
+
+            # Solve for a linear continuum scale analytically
+            T  = tel_on_obs[valid]
+            d  = flux_obs[valid]
+            w  = 1.0 / sigma_obs[valid] ** 2
+            # scalar continuum: flux = c * T  =>  c = sum(w*d*T) / sum(w*T^2)
+            c  = np.sum(w * d * T) / np.sum(w * T ** 2)
+            resid = d - c * T
+            return float(np.sum(resid ** 2 * w))
+
+        print(f"[primitive] Fitting airmass in {am_bounds}  "
+              f"(PWV fixed at {pwv:.3f})...")
+        from scipy.optimize import differential_evolution
+        res = differential_evolution(
+            _chi2_am,
+            bounds=[am_bounds],
+            seed=42,
+            popsize=15,
+            tol=1e-6,
+            polish=True,
+            workers=1,
+        )
+        am_used = float(res.x[0])
+        airmass_fitted = True
+        print(f"[primitive] Fitted airmass: {am_used:.4f}  "
+              f"(header/param was {am_init:.4f})  chi2={res.fun:.4f}")
+    else:
+        am_used = am_init
+
+    # ----------------------------------------------------------
+    # 4.  Scale telluric model to the resolved airmass
+    # ----------------------------------------------------------
+    telluric_native = scale_psg(psg_tuple, airmass=am_used, pwv=pwv)
+
+    telluric_on_obs = np.interp(
+        wave_obs, lam_model, telluric_native,
+        left=np.nan, right=np.nan,
+    )
+
+    # ----------------------------------------------------------
+    # 5.  Divide out telluric model
+    # ----------------------------------------------------------
+    T_safe          = np.clip(telluric_on_obs, telluric_floor, np.inf)
+    corrected_flux  = flux_obs  / T_safe
+    corrected_sigma = sigma_obs / T_safe
+
+    # ----------------------------------------------------------
+    # 6.  Write FITS output
+    #     Extension 0 (Primary) : metadata header
+    #     Extension 1           : corrected flux + sigma
+    #     Extension 2           : telluric model on obs grid
+    # ----------------------------------------------------------
+    phdu = fits.PrimaryHDU()
+
+    # Copy input observation metadata if available
+    if header is not None:
+        for key, val in header.items():
+            if key in ("SIMPLE", "EXTEND", "NAXIS", "NAXIS1",
+                       "BITPIX", "", "END"):
+                continue
+            try:
+                phdu.header[key] = val
+            except Exception:
+                pass
+
+    # Record what was applied
+    phdu.header["TCORR"]   = (True,             "Telluric correction applied")
+    phdu.header["TCMODEL"] = (os.path.basename(model_fits), "Telluric model file")
+    phdu.header["TCAIRM"]  = (am_used,           "Airmass used for telluric scaling")
+    phdu.header["TCAMFIT"] = (airmass_fitted,     "True if airmass was fitted to data")
+    phdu.header["TCPWV"]   = (pwv,               "PWV perturbation applied (fixed)")
+    phdu.header["TCFLOOR"] = (telluric_floor,     "Telluric floor before division")
+    if l0 is not None:
+        phdu.header["TCL0"] = (l0, "Trim wavelength min nm")
+    if l1 is not None:
+        phdu.header["TCL1"] = (l1, "Trim wavelength max nm")
+
+    # Extension 1: corrected spectrum
+    spec_hdu = fits.ImageHDU(
+        data = np.vstack([wave_obs, corrected_flux, corrected_sigma]),
+        name = "CORRECTED",
+    )
+    spec_hdu.header["ROW0"] = "wavelength_nm"
+    spec_hdu.header["ROW1"] = "corrected_flux"
+    spec_hdu.header["ROW2"] = "corrected_sigma"
+
+    # Extension 2: telluric model so the science team can inspect it
+    tel_hdu = fits.ImageHDU(
+        data = np.vstack([wave_obs, telluric_on_obs]),
+        name = "TELLURIC_MODEL",
+    )
+    tel_hdu.header["ROW0"] = "wavelength_nm"
+    tel_hdu.header["ROW1"] = "telluric_transmission"
+
+    hdulist = fits.HDUList([phdu, spec_hdu, tel_hdu])
+    hdulist.writeto(output_fits, overwrite=True)
+    print(
+        f"[primitive] Wrote {output_fits}  "
+        f"airmass={am_used:.4f} (fitted={airmass_fitted})  "
+        f"pwv={pwv:.3f}  floor={telluric_floor:.1e}"
+    )
+
+    return {
+        "corrected_flux":  corrected_flux,
+        "corrected_sigma": corrected_sigma,
+        "telluric_model":  telluric_on_obs,
+        "airmass_used":    am_used,
+        "airmass_fitted":  airmass_fitted,
+    }
+
+
+# ============================================================
+# FITS SPECTRUM READER
+# ============================================================
+
+# Extension names to try when looking for spectrum data, in order.
+# HISPEC/LIGER names will be added here once the DRP format is finalised.
+SPECTRUM_EXTNAMES = (
+    "SPECTRUM", "SCI", "SCIENCE", "FLUX", "DATA", "PRIMARY",
+)
+
+# Header keywords to try for the wavelength start/step (WCS style)
+WCS_CRVAL = ("CRVAL1",)
+WCS_CDELT = ("CDELT1", "CD1_1")
+WCS_CRPIX = ("CRPIX1",)
+
+
+def read_spectrum_fits(
+    fits_path:      str,
+    wave_ext:       Optional[str] = None,
+    flux_ext:       Optional[str] = None,
+    sigma_ext:      Optional[str] = None,
+    wave_keyword:   Optional[str] = None,
+    flux_keyword:   Optional[str] = None,
+    sigma_keyword:  Optional[str] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+    """
+    Read a 1-D spectrum from a FITS file and return arrays ready
+    to pass to apply_telluric_primitive().
+
+    The reader tries several common layouts in order and returns
+    the first one that works.  Once the HISPEC/LIGER DRP format is
+    finalised, explicit ext/keyword overrides should be passed in
+    to skip the auto-detection.
+
+    Layout detection order
+    ----------------------
+    1.  Caller-supplied extension names / column keywords (highest priority)
+    2.  Binary table with named columns (WAVE/FLUX/SIGMA or similar)
+    3.  Separate image extensions for flux and sigma
+    4.  Single image extension with WCS wavelength axis
+
+    Parameters
+    ----------
+    fits_path     : path to the input FITS file
+    wave_ext      : extension name or index containing the wavelength array
+    flux_ext      : extension name or index containing the flux array
+    sigma_ext     : extension name or index containing the uncertainty array
+                    (None = fill with ones if not found)
+    wave_keyword  : binary-table column name for wavelength
+    flux_keyword  : binary-table column name for flux
+    sigma_keyword : binary-table column name for uncertainty
+
+    Returns
+    -------
+    wave_obs  : (N,) wavelength array in nm
+    flux_obs  : (N,) flux array
+    sigma_obs : (N,) uncertainty array (ones if not found)
+    header    : combined primary + data extension header dict
+    """
+    import astropy.io.fits as fits
+
+    if not os.path.exists(fits_path):
+        raise FileNotFoundError(f"Spectrum FITS not found: {fits_path}")
+
+    with fits.open(fits_path) as hdulist:
+        # Merge primary header with first data extension header
+        primary_header = dict(hdulist[0].header)
+
+        # -------------------------------------------------------
+        # Strategy 1: Caller provided explicit extension names
+        # -------------------------------------------------------
+        if flux_ext is not None:
+            flux_hdu = hdulist[flux_ext]
+            header   = {**primary_header, **dict(flux_hdu.header)}
+
+            # Try to get wavelength
+            if wave_ext is not None:
+                wave_nm = np.asarray(hdulist[wave_ext].data, float).ravel()
+            else:
+                wave_nm = _wcs_wavelength(flux_hdu.header, len(flux_hdu.data.ravel()))
+
+            flux_obs  = np.asarray(flux_hdu.data, float).ravel()
+            sigma_obs = (
+                np.asarray(hdulist[sigma_ext].data, float).ravel()
+                if sigma_ext is not None else np.ones_like(flux_obs)
+            )
+            print(f"[reader] Loaded via explicit extensions from {fits_path}")
+            return wave_nm, flux_obs, sigma_obs, header
+
+        # -------------------------------------------------------
+        # Strategy 2: Binary table with named columns
+        # -------------------------------------------------------
+        for extname in SPECTRUM_EXTNAMES:
+            try:
+                hdu = hdulist[extname]
+            except (KeyError, IndexError):
+                continue
+            if hdu.data is None:
+                continue
+            try:
+                cols = hdu.columns.names
+            except AttributeError:
+                continue   # not a table
+
+            header = {**primary_header, **dict(hdu.header)}
+
+            wave_col  = wave_keyword  or _find_wave_col(cols)
+            flux_col  = flux_keyword  or _find_flux_col(cols)
+            sigma_col = sigma_keyword or _find_sigma_col(cols)
+
+            if flux_col is None:
+                continue
+
+            flux_obs  = np.asarray(hdu.data[flux_col],  float).ravel()
+            sigma_obs = (
+                np.asarray(hdu.data[sigma_col], float).ravel()
+                if sigma_col is not None else np.ones_like(flux_obs)
+            )
+
+            if wave_col is not None:
+                wave_nm = np.asarray(hdu.data[wave_col], float).ravel()
+            else:
+                wave_nm = _wcs_wavelength(hdu.header, len(flux_obs))
+
+            print(f"[reader] Loaded binary table ext='{extname}' "
+                  f"wave='{wave_col}' flux='{flux_col}' "
+                  f"sigma='{sigma_col}' from {fits_path}")
+            return wave_nm, flux_obs, sigma_obs, header
+
+        # -------------------------------------------------------
+        # Strategy 3: Separate image extensions
+        # -------------------------------------------------------
+        flux_hdu  = None
+        sigma_hdu = None
+
+        for extname in SPECTRUM_EXTNAMES:
+            try:
+                hdu = hdulist[extname]
+                if hdu.data is not None and hdu.data.ndim >= 1:
+                    flux_hdu = hdu
+                    break
+            except (KeyError, IndexError):
+                continue
+
+        if flux_hdu is None and hdulist[0].data is not None:
+            flux_hdu = hdulist[0]
+
+        if flux_hdu is not None:
+            header    = {**primary_header, **dict(flux_hdu.header)}
+            flux_obs  = np.asarray(flux_hdu.data, float).ravel()
+            wave_nm   = _wcs_wavelength(flux_hdu.header, len(flux_obs))
+
+            # Look for a sigma/error extension
+            for err_name in ("SIGMA", "ERR", "ERROR", "NOISE", "IVAR", "VAR"):
+                try:
+                    ehdu = hdulist[err_name]
+                    if ehdu.data is not None:
+                        raw = np.asarray(ehdu.data, float).ravel()
+                        # Convert inverse variance to sigma if needed
+                        if "IVAR" in err_name or "VAR" in err_name:
+                            with np.errstate(divide="ignore", invalid="ignore"):
+                                sigma_obs = np.where(raw > 0, 1.0 / np.sqrt(raw), np.inf)
+                        else:
+                            sigma_obs = raw
+                        print(f"[reader] Loaded image extensions, "
+                              f"sigma from '{err_name}' in {fits_path}")
+                        return wave_nm, flux_obs, sigma_obs, header
+                except (KeyError, IndexError):
+                    continue
+
+            sigma_obs = np.ones_like(flux_obs)
+            print(f"[reader] Loaded image extension; no sigma found, "
+                  f"using ones. From {fits_path}")
+            return wave_nm, flux_obs, sigma_obs, header
+
+    raise ValueError(
+        f"Could not read spectrum from {fits_path}.\n"
+        "Try passing explicit wave_ext, flux_ext, sigma_ext."
+    )
+
+
+def _wcs_wavelength(header, n: int) -> np.ndarray:
+    """
+    Reconstruct a wavelength axis from WCS keywords in a FITS header.
+    Returns wavelength in nm (converts from Angstroms if CUNIT1 is set).
+    Falls back to pixel indices if no WCS keywords are found.
+    """
+    crval = None
+    cdelt = None
+    crpix = 1.0
+
+    for key in WCS_CRVAL:
+        if key in header:
+            crval = float(header[key]); break
+    for key in WCS_CDELT:
+        if key in header:
+            cdelt = float(header[key]); break
+    for key in WCS_CRPIX:
+        if key in header:
+            crpix = float(header[key]); break
+
+    if crval is None or cdelt is None:
+        print("  [reader] No WCS keywords found — using pixel indices as wavelength")
+        return np.arange(n, dtype=float)
+
+    pix  = np.arange(1, n + 1, dtype=float)
+    wave = crval + cdelt * (pix - crpix)
+
+    # Convert Angstroms to nm if needed
+    cunit = str(header.get("CUNIT1", "")).strip().lower()
+    if cunit in ("angstrom", "angstroms", "a"):
+        wave = wave / 10.0
+    elif cunit in ("um", "micron", "microns"):
+        wave = wave * 1000.0
+    elif cunit in ("m", "meter", "meters"):
+        wave = wave * 1e9
+
+    return wave
+
+
+def _find_wave_col(cols: list) -> Optional[str]:
+    for name in ("WAVE", "WAVELENGTH", "LAMBDA", "WAV", "WVLG"):
+        for c in cols:
+            if c.upper() == name:
+                return c
+    return None
+
+
+def _find_flux_col(cols: list) -> Optional[str]:
+    for name in ("FLUX", "SCI", "SCIENCE", "DATA", "SPEC", "INTENSITY"):
+        for c in cols:
+            if c.upper() == name:
+                return c
+    return None
+
+
+def _find_sigma_col(cols: list) -> Optional[str]:
+    for name in ("SIGMA", "ERR", "ERROR", "NOISE", "UNC", "UNCERTAINTY"):
+        for c in cols:
+            if c.upper() == name:
+                return c
+    return None
+
+
 # ============================================================
 # SPECTRUM TRIMMING UTILITY
 # ============================================================
@@ -1120,8 +1818,8 @@ def plot_am_dlam_heatmap(interp, wave_obs, flux_obs, sigma_obs, mask, lam_grid,
     # plt.xlabel("Airmass"); plt.ylabel(r"$\delta\lambda$ (nm)")
     # plt.title(f"$\\Delta\\chi^2$ Heat Map  (T={T_fixed:.1f} K)")
     # plt.legend(); plt.tight_layout(); plt.show()
-    print(f"\n[heatmap] Best: AM={best_am:.4f}  dlam={best_dlam:.4f} nm  "
-          f"chi2={chi2_map[min_idx]:.4f}")
+    # print(f"\n[heatmap] Best: AM={best_am:.4f}  dlam={best_dlam:.4f} nm  "
+    #       f"chi2={chi2_map[min_idx]:.4f}")
     return am_vals, dlam_vals, chi2_map
 
 
@@ -1209,6 +1907,31 @@ if __name__ == "__main__":
         cfg_obj=cfg, airmass_grid=airmass_grid,
         temp_grid=temp_grid, force_rebuild=True,
     )
+
+    # ----------------------------------------------------------
+    # 2b. Generate the average PSG model FITS file
+    #     One-time offline step: PSG called at am=1.0 with typical
+    #     Maunakea conditions and saved as a FITS binary table.
+    #     The DRP primitive loads this file at runtime instead of
+    #     calling PSG live.
+    # ----------------------------------------------------------
+    avg_fits = save_average_psg_model(
+        cfg_obj   = cfg,
+        fits_path = "average_psg_model.fits",
+        am        = 1.0,
+        surface_T = 280.0,
+        h2o_abun  = 1.0,
+        force_rebuild = False,
+    )
+
+    # Verify the loader round-trips correctly
+    lam_avg, psg_tuple_avg = load_average_psg_model(
+        fits_path = avg_fits,
+        l0        = 960.0,
+        l1        = 2500.0,
+    )
+    print(f"[verify] Loaded average model: {len(lam_avg)} pts  "
+          f"H2O range: {psg_tuple_avg[0].min():.4f} - {psg_tuple_avg[0].max():.4f}")
 
     T_FIXED = 280.0
     R_INST  = 8_000.0
