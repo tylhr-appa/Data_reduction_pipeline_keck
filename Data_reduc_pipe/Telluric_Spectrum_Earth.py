@@ -1734,8 +1734,65 @@ def _find_sigma_col(cols: list) -> Optional[str]:
 # SPECTRUM TRIMMING UTILITY
 # ============================================================
 
-def trim_spectrum(lam, flux, l0=None, l1=None):
-    """Trim spectrum to [l0, l1].  None = use full range on that side."""
+# HISPEC channel boundaries in nm.
+# BSPEC covers y+J band (silica fiber),  RSPEC covers H+K band (ZBLAN fiber).
+# The dichroic split is at approximately 1400 nm based on the fiber material
+# change documented in the HISPEC fiber delivery subsystem paper (Jovanovic
+# et al. 2024, SPIE 13096).  Confirm the exact value before
+# using these in production — the instrument is pre-commissioning and the
+# boundary may shift slightly in the final design.
+HISPEC_BSPEC_LAM_MIN =  980.0   # nm  (y-band blue edge)
+HISPEC_BSPEC_LAM_MAX = 1400.0   # nm  (yJ / HK dichroic, approx.)
+HISPEC_RSPEC_LAM_MIN = 1400.0   # nm  (HK red edge of dichroic, approx.)
+HISPEC_RSPEC_LAM_MAX = 2500.0   # nm  (K-band red edge)
+
+
+def trim_spectrum(
+    lam:     np.ndarray,
+    flux:    np.ndarray,
+    l0:      Optional[float] = None,
+    l1:      Optional[float] = None,
+    channel: Optional[str]  = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Trim a spectrum to a wavelength range.
+
+    Parameters
+    ----------
+    lam     : wavelength array in nm
+    flux    : flux array (same length as lam)
+    l0      : lower bound in nm  (None = no lower trim)
+    l1      : upper bound in nm  (None = no upper trim)
+    channel : 'bspec' or 'rspec' — sets l0/l1 to the HISPEC channel
+              boundaries automatically.  Explicit l0/l1 override the
+              channel defaults if provided alongside channel.
+
+              NOTE: the bspec/rspec boundaries are approximate (see
+              HISPEC_BSPEC_LAM_MAX / HISPEC_RSPEC_LAM_MIN constants).
+              Confirm with your advisor before using in production.
+
+    Returns
+    -------
+    lam_trimmed, flux_trimmed
+    """
+    # Apply channel defaults first, then let explicit l0/l1 override
+    if channel is not None:
+        ch = channel.lower().strip()
+        if ch == "bspec":
+            if l0 is None:
+                l0 = HISPEC_BSPEC_LAM_MIN
+            if l1 is None:
+                l1 = HISPEC_BSPEC_LAM_MAX
+        elif ch == "rspec":
+            if l0 is None:
+                l0 = HISPEC_RSPEC_LAM_MIN
+            if l1 is None:
+                l1 = HISPEC_RSPEC_LAM_MAX
+        else:
+            raise ValueError(
+                f"Unknown channel '{channel}'. Choose 'bspec' or 'rspec'."
+            )
+
     mask = np.ones(len(lam), bool)
     if l0 is not None:
         mask &= (lam >= l0)
@@ -1794,33 +1851,33 @@ def plot_corrected_spectrum(wave_obs, products):
     plt.title("Telluric-corrected Spectrum")
     plt.legend(); plt.tight_layout(); plt.show()
 
-def plot_am_dlam_heatmap(interp, wave_obs, flux_obs, sigma_obs, mask, lam_grid,
-                          R_inst, T_fixed=280.0, am_bounds=(1.0, 2.5),
-                          dlam_bounds=(-0.5, 0.5), n_am=80, n_dlam=80):
-    am_vals   = np.linspace(*am_bounds, n_am)
-    dlam_vals = np.linspace(*dlam_bounds, n_dlam)
-    chi2_map  = np.full((n_dlam, n_am), np.nan)
-    for j, dlam in enumerate(dlam_vals):
-        for i, am in enumerate(am_vals):
-            chi2_map[j, i] = chi2([am, dlam], interp, wave_obs, flux_obs,
-                                  sigma_obs, mask, lam_grid, R_inst, T_fixed=T_fixed)
-    finite = np.isfinite(chi2_map) & (chi2_map < 1e98)
-    dchi2_map = np.full_like(chi2_map, np.nan)
-    dchi2_map[finite] = chi2_map[finite] - np.nanmin(chi2_map[finite])
-    min_idx   = np.unravel_index(np.nanargmin(chi2_map), chi2_map.shape)
-    best_am, best_dlam = am_vals[min_idx[1]], dlam_vals[min_idx[0]]
-    # plt.figure(figsize=(9, 7))
-    # im = plt.imshow(dchi2_map, origin="lower", aspect="auto",
-    #                 extent=[am_vals[0], am_vals[-1], dlam_vals[0], dlam_vals[-1]])
-    # plt.colorbar(im, label=r"$\Delta\chi^2$")
-    # plt.plot(best_am, best_dlam, "wx", ms=10, mew=2,
-    #          label=f"Best: AM={best_am:.3f}, dlam={best_dlam:.4f} nm")
-    # plt.xlabel("Airmass"); plt.ylabel(r"$\delta\lambda$ (nm)")
-    # plt.title(f"$\\Delta\\chi^2$ Heat Map  (T={T_fixed:.1f} K)")
-    # plt.legend(); plt.tight_layout(); plt.show()
-    # print(f"\n[heatmap] Best: AM={best_am:.4f}  dlam={best_dlam:.4f} nm  "
-    #       f"chi2={chi2_map[min_idx]:.4f}")
-    return am_vals, dlam_vals, chi2_map
+# def plot_am_dlam_heatmap(interp, wave_obs, flux_obs, sigma_obs, mask, lam_grid,
+#                           R_inst, T_fixed=280.0, am_bounds=(1.0, 2.5),
+#                           dlam_bounds=(-0.5, 0.5), n_am=80, n_dlam=80):
+#     am_vals   = np.linspace(*am_bounds, n_am)
+#     dlam_vals = np.linspace(*dlam_bounds, n_dlam)
+#     chi2_map  = np.full((n_dlam, n_am), np.nan)
+#     for j, dlam in enumerate(dlam_vals):
+#         for i, am in enumerate(am_vals):
+#             chi2_map[j, i] = chi2([am, dlam], interp, wave_obs, flux_obs,
+#                                   sigma_obs, mask, lam_grid, R_inst, T_fixed=T_fixed)
+#     finite = np.isfinite(chi2_map) & (chi2_map < 1e98)
+#     dchi2_map = np.full_like(chi2_map, np.nan)
+#     dchi2_map[finite] = chi2_map[finite] - np.nanmin(chi2_map[finite])
+#     min_idx   = np.unravel_index(np.nanargmin(chi2_map), chi2_map.shape)
+#     best_am, best_dlam = am_vals[min_idx[1]], dlam_vals[min_idx[0]]
+#     plt.figure(figsize=(9, 7))
+#     im = plt.imshow(dchi2_map, origin="lower", aspect="auto",
+#                     extent=[am_vals[0], am_vals[-1], dlam_vals[0], dlam_vals[-1]])
+#     plt.colorbar(im, label=r"$\Delta\chi^2$")
+#     plt.plot(best_am, best_dlam, "wx", ms=10, mew=2,
+#              label=f"Best: AM={best_am:.3f}, dlam={best_dlam:.4f} nm")
+#     plt.xlabel("Airmass"); plt.ylabel(r"$\delta\lambda$ (nm)")
+#     plt.title(f"$\\Delta\\chi^2$ Heat Map  (T={T_fixed:.1f} K)")
+#     plt.legend(); plt.tight_layout(); plt.show()
+#     print(f"\n[heatmap] Best: AM={best_am:.4f}  dlam={best_dlam:.4f} nm  "
+#           f"chi2={chi2_map[min_idx]:.4f}")
+#     return am_vals, dlam_vals, chi2_map
 
 
 # ============================================================
@@ -1977,16 +2034,5 @@ if __name__ == "__main__":
     plot_vs_airmass(interp, lam_grid, surface_T=T_FIXED, lam_range=(1550.0, 1750.0))
     plot_best_fit(wave_obs, flux_obs, sigma_obs, interp, lam_grid, best_params, R_INST)
     plot_corrected_spectrum(wave_obs, products)
-
-    plot_am_dlam_heatmap(interp, wave_obs, flux_obs, sigma_obs, fit_mask,
-                          lam_grid, R_INST, T_fixed=T_FIXED,
-                          am_bounds=(1.0, 2.5), dlam_bounds=(-0.5, 0.5))
-    plot_am_dlam_heatmap(
-        interp, wave_obs, flux_obs, sigma_obs, fit_mask, lam_grid, R_INST,
-        T_fixed=T_FIXED,
-        am_bounds=(max(1.0, best_params["airmass"] - 0.3),
-                   min(2.5, best_params["airmass"] + 0.3)),
-        dlam_bounds=(best_params["dlam_nm"] - 0.1, best_params["dlam_nm"] + 0.1),
-        n_am=120, n_dlam=120)
 
     print("\nPipeline complete.")

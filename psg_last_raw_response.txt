@@ -1,8 +1,8 @@
 # ------------------------------------------------------------------------
 # NASA-GSFC Planetary Spectrum Generator (PSG, Villanueva et al. 2018, 2022)
 # Atmospheric transmittance spectrum synthesized with PUMAS
-# Synthesized on Tue May 26 06:38:48 2026
-# Radiative transfer took 1.438 seconds
+# Synthesized on Sun Jun 28 21:07:22 2026
+# Radiative transfer took 1.429 seconds
 # Spectral unit: Wavelength[nm]
 # ------------------------------------------------------------------------
 # Wave/freq Total H2O CO2 O3 N2O CO CH4 O2 N2  Rayleigh CIA
