@@ -24,15 +24,15 @@ PWV (precipitable water vapor) is fixed from MERRA-2 meteorological data embedde
 
 ```
 PSG API
-  └── fetch_stitched_spectrum()     # sub-band split + stitch for wide ranges
-        └── build_grid_hdf5()      # 3-D grid: [airmass, T, wavelength]
-              └── scale_psg()      # Beer-Lambert per-species scaling
-                    └── make_telluric_interp()   # RegularGridInterpolator
-                          └── fit_telluric()     # Differential Evolution fit
+  └── fetch_stitched_spectrum()                                   # sub-band split + stitch for wide ranges
+        └── build_grid_hdf5()                                     # 3-D grid: [airmass, T, wavelength]
+              └── scale_psg()                                     # Beer-Lambert per-species scaling
+                    └── make_telluric_interp()                    # RegularGridInterpolator
+                          └── fit_telluric()                       # Differential Evolution fit
                                 └── apply_telluric_correction()
 
-save_average_psg_model()           # one-time: write average model to FITS
-  └── load_average_psg_model()     # load FITS model at runtime
+save_average_psg_model()                 # one-time: write average model to FITS
+  └── load_average_psg_model()            # load FITS model at runtime
         └── apply_telluric_primitive()   # DRP-facing function
               └── read_spectrum_fits()   # flexible FITS reader
 ```
@@ -41,17 +41,17 @@ save_average_psg_model()           # one-time: write average model to FITS
 
 ## Key Design Choices
 
-**Sub-band stitching.** At R=200,000 over 1540 nm, PSG cannot return the full HISPEC range in one call. The pipeline splits the range into configurable sub-bands (~500 nm each with 10 nm overlap), calls PSG for each, and stitches the responses. Everything above this layer sees one continuous spectrum.
+**Sub-band stitching:** At R=200,000 over 1540 nm, PSG cannot return the full HISPEC range in one call. The pipeline splits the range into configurable sub-bands (~500 nm each with 10 nm overlap), calls PSG for each, and stitches the responses. Everything above this layer sees one continuous spectrum.
 
-**Beer-Lambert scaling.** PSG is called once at airmass=1.0 per temperature node. `scale_psg()` fills the airmass axis analytically:
+**Beer-Lambert scaling:** PSG is called once at airmass=1.0 per temperature node. `scale_psg()` fills the airmass axis analytically:
 ```
 T(airmass) = T_H2O^(airmass + pwv) × (T_CO2 × T_CH4 × ... )^airmass
 ```
 This eliminates the need for a PSG call per airmass value.
 
-**Differential Evolution fitting.** Telluric chi-square surfaces have broad, shallow basins where gradient methods get stuck. DE explores the full parameter space before polishing with L-BFGS-B.
+**Differential Evolution fitting:** Telluric chi-square surfaces have broad, shallow basins where gradient methods get stuck. DE explores the full parameter space before polishing with L-BFGS-B.
 
-**Disk caching.** Every PSG call is cached to disk keyed by a SHA-256 hash of the full config. Rebuilding after code changes (not PSG config changes) costs zero API calls. Column names are saved in a sidecar `.cols` file so they survive cache hits.
+**Disk caching:** Every PSG call is cached to disk keyed by a SHA-256 hash of the full config. Rebuilding after code changes (not PSG config changes) costs zero API calls. Column names are saved in a sidecar `.cols` file so they survive cache hits.
 
 ---
 
