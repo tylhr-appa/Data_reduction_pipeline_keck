@@ -16,7 +16,7 @@ The pipeline is designed to slot into the HISPEC DRP as a telluric calibration p
 
 Earth's atmosphere absorbs starlight at specific wavelengths due to molecules including H₂O, CO₂, CH₄, CO, O₃, N₂O, and O₂. These telluric absorption features must be removed before doing science with near-infrared spectra. The pipeline models this absorption using PSG's HITRAN-based radiative transfer, then scales the model to the airmass of each observation.
 
-PWV (precipitable water vapor) is fixed from MERRA-2 meteorological data embedded in the PSG template rather than fitted freely. Fitting PWV and airmass simultaneously is unreliable due to their degeneracy — this follows the same approach used by MOLECFIT, TelFit, and Xtellcor.
+PWV (precipitable water vapor) is fixed from MERRA-2 meteorological data embedded in the PSG template rather than fitted freely. Fitting PWV and airmass simultaneously is unreliable due to their degeneracy, this follows the same approach used by MOLECFIT, TelFit, and Xtellcor.
 
 ---
 
@@ -246,5 +246,4 @@ This module is under active development as part of the HISPEC DRP telluric primi
 - [x] Flexible FITS spectrum reader
 - [x] BSPEC/RSPEC channel trimming
 - [ ] Validate against real HISPEC/LIGER FITS files
-- [ ] Confirm bspec/rspec boundary wavelength with HISPEC team
 - [ ] Atmospheric variability grid (Goal 3, TBD)
