@@ -1,9 +1,8 @@
 """
 Telluric correction pipeline for Keck LIGER
-============================================
 
-Architecture
-------------
+Architecture:
+
 PSG is called without watm=y so the ATMOSPHERE-LAYER entries from
 the template are used verbatim.  This preserves per-species H2O line
 absorption in the output columns, which scale_psg then uses to apply
@@ -21,8 +20,8 @@ correction pipelines (MOLECFIT, TelFit, Xtellcor) which fix PWV from
 an external measurement rather than fitting it freely, because the
 airmass-PWV degeneracy makes simultaneous recovery unreliable.
 
-Key design choices
-------------------
+Key design choices:
+
 1.  PSG uses the template ATMOSPHERE-LAYER entries verbatim (no watm=y)
     so the H2O column reflects true HITRAN line absorption, enabling
     scale_psg to apply per-species Beer-Lambert scaling analytically.
@@ -43,13 +42,9 @@ Key design choices
     rebuilding the grid after non-PSG code changes costs zero API calls.
 7.  Grid validity is keyed to (date, site, wavelength, airmass grid,
     temp grid) so any axis change invalidates stale grids.
-8.  The three-panel diagnostic plot reproduces the Raw_PSG_H2O figure
-    showing Total transmission at native, intermediate, and instrument
-    resolving power.
 """
 
 from __future__ import annotations
-
 import hashlib
 import io
 import os
@@ -57,7 +52,6 @@ import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
-
 import h5py
 import matplotlib.pyplot as plt
 import numpy as np
@@ -65,6 +59,7 @@ import requests
 from scipy.interpolate import RegularGridInterpolator
 from scipy.ndimage import gaussian_filter1d
 from scipy.optimize import minimize, differential_evolution
+import astropy.io.fits as fits
 
 
 # ============================================================
@@ -712,8 +707,8 @@ def save_average_psg_model(
     are the raw PSG transmission values at am=1.0 before any
     Beer-Lambert scaling — scale_psg applies the scaling at fit time.
 
-    Parameters
-    ----------
+    Parameters:
+
     cfg_obj   : PipelineConfig controlling wavelength range and PSG settings
     fits_path : output path for the FITS file
     am        : airmass for the PSG call (should be 1.0 for the base model)
@@ -721,11 +716,10 @@ def save_average_psg_model(
     h2o_abun  : H2O abundance scaling (1.0 = template default)
     force_rebuild : if True, re-fetch from PSG even if fits_path exists
 
-    Returns
-    -------
+    Returns:
+
     fits_path : path to the written FITS file
     """
-    import astropy.io.fits as fits
 
     if not force_rebuild and os.path.exists(fits_path):
         print(f"[psg_fits] Average model already exists: {fits_path}")
@@ -805,14 +799,14 @@ def load_average_psg_model(
     Equivalent to KPIC's open_psg_allmol but reads from the FITS
     format written by save_average_psg_model.
 
-    Parameters
-    ----------
+    Parameters:
+
     fits_path : path to the FITS file written by save_average_psg_model
     l0        : lower wavelength bound in nm (None = use full range)
     l1        : upper wavelength bound in nm (None = use full range)
 
-    Returns
-    -------
+    Returns:
+
     lam_nm    : (N,) wavelength array in nm
     psg_tuple : (H2O, CO2, CH4, CO, O3, N2O, O2) transmission arrays
                 ready to pass directly to scale_psg()
@@ -1256,8 +1250,8 @@ def apply_telluric_primitive(
     the observed spectrum, and writes the corrected spectrum plus the
     telluric model to a FITS output file.
 
-    Airmass resolution
-    ------------------
+    Airmass resolution:
+
     If fit_airmass=False (default):
         1.  FITS header  (if header is provided and contains a valid AIRMASS key)
         2.  airmass parameter  (explicit override)
@@ -1269,8 +1263,8 @@ def apply_telluric_primitive(
         value replaces the header value.  PWV is kept fixed (not fitted)
         to avoid the airmass-PWV degeneracy.
 
-    Parameters
-    ----------
+    Parameters:
+
     wave_obs       : (N,) wavelength array in nm
     flux_obs       : (N,) observed flux array
     sigma_obs      : (N,) per-pixel uncertainty array
@@ -1294,8 +1288,8 @@ def apply_telluric_primitive(
     telluric_floor : minimum telluric transmission before division to
                      avoid blowing up near saturated lines
 
-    Returns
-    -------
+    Returns:
+
     dict with keys:
         corrected_flux   : telluric-corrected flux
         corrected_sigma  : propagated uncertainties
@@ -1520,15 +1514,15 @@ def read_spectrum_fits(
     finalised, explicit ext/keyword overrides should be passed in
     to skip the auto-detection.
 
-    Layout detection order
-    ----------------------
+    Layout detection order:
+
     1.  Caller-supplied extension names / column keywords (highest priority)
     2.  Binary table with named columns (WAVE/FLUX/SIGMA or similar)
     3.  Separate image extensions for flux and sigma
     4.  Single image extension with WCS wavelength axis
 
-    Parameters
-    ----------
+    Parameters:
+
     fits_path     : path to the input FITS file
     wave_ext      : extension name or index containing the wavelength array
     flux_ext      : extension name or index containing the flux array
@@ -1538,8 +1532,8 @@ def read_spectrum_fits(
     flux_keyword  : binary-table column name for flux
     sigma_keyword : binary-table column name for uncertainty
 
-    Returns
-    -------
+    Returns:
+
     wave_obs  : (N,) wavelength array in nm
     flux_obs  : (N,) flux array
     sigma_obs : (N,) uncertainty array (ones if not found)
@@ -1757,8 +1751,8 @@ def trim_spectrum(
     """
     Trim a spectrum to a wavelength range.
 
-    Parameters
-    ----------
+    Parameters:
+
     lam     : wavelength array in nm
     flux    : flux array (same length as lam)
     l0      : lower bound in nm  (None = no lower trim)
@@ -1771,8 +1765,8 @@ def trim_spectrum(
               HISPEC_BSPEC_LAM_MAX / HISPEC_RSPEC_LAM_MIN constants).
               Confirm with your advisor before using in production.
 
-    Returns
-    -------
+    Returns:
+
     lam_trimmed, flux_trimmed
     """
     # Apply channel defaults first, then let explicit l0/l1 override
@@ -1851,33 +1845,6 @@ def plot_corrected_spectrum(wave_obs, products):
     plt.title("Telluric-corrected Spectrum")
     plt.legend(); plt.tight_layout(); plt.show()
 
-# def plot_am_dlam_heatmap(interp, wave_obs, flux_obs, sigma_obs, mask, lam_grid,
-#                           R_inst, T_fixed=280.0, am_bounds=(1.0, 2.5),
-#                           dlam_bounds=(-0.5, 0.5), n_am=80, n_dlam=80):
-#     am_vals   = np.linspace(*am_bounds, n_am)
-#     dlam_vals = np.linspace(*dlam_bounds, n_dlam)
-#     chi2_map  = np.full((n_dlam, n_am), np.nan)
-#     for j, dlam in enumerate(dlam_vals):
-#         for i, am in enumerate(am_vals):
-#             chi2_map[j, i] = chi2([am, dlam], interp, wave_obs, flux_obs,
-#                                   sigma_obs, mask, lam_grid, R_inst, T_fixed=T_fixed)
-#     finite = np.isfinite(chi2_map) & (chi2_map < 1e98)
-#     dchi2_map = np.full_like(chi2_map, np.nan)
-#     dchi2_map[finite] = chi2_map[finite] - np.nanmin(chi2_map[finite])
-#     min_idx   = np.unravel_index(np.nanargmin(chi2_map), chi2_map.shape)
-#     best_am, best_dlam = am_vals[min_idx[1]], dlam_vals[min_idx[0]]
-#     plt.figure(figsize=(9, 7))
-#     im = plt.imshow(dchi2_map, origin="lower", aspect="auto",
-#                     extent=[am_vals[0], am_vals[-1], dlam_vals[0], dlam_vals[-1]])
-#     plt.colorbar(im, label=r"$\Delta\chi^2$")
-#     plt.plot(best_am, best_dlam, "wx", ms=10, mew=2,
-#              label=f"Best: AM={best_am:.3f}, dlam={best_dlam:.4f} nm")
-#     plt.xlabel("Airmass"); plt.ylabel(r"$\delta\lambda$ (nm)")
-#     plt.title(f"$\\Delta\\chi^2$ Heat Map  (T={T_fixed:.1f} K)")
-#     plt.legend(); plt.tight_layout(); plt.show()
-#     print(f"\n[heatmap] Best: AM={best_am:.4f}  dlam={best_dlam:.4f} nm  "
-#           f"chi2={chi2_map[min_idx]:.4f}")
-#     return am_vals, dlam_vals, chi2_map
 
 
 # ============================================================
