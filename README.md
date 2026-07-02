@@ -1,3 +1,5 @@
+To access the pipeline, Data_reduc_pipe --> Telluric_Spectrum_Earth.py
+
 # Telluric Correction Pipeline for Keck HISPEC/LIGER
 
 A PSG-based telluric correction module for the HISPEC Data Reduction Pipeline (DRP) at Keck Observatory. Developed as part of the undergraduate research program at Keck Observatory.
